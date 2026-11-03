@@ -1,6 +1,40 @@
 import Foundation
 import MCP
 
+enum MCPModernResponseMetadata {
+  private static let cacheableMethods: Set<String> = [
+    "server/discover",
+    "tools/list",
+    "prompts/list",
+    "resources/list",
+    "resources/templates/list",
+    "resources/read",
+  ]
+
+  static func addingRequiredFields(
+    to originalResult: [String: Any],
+    method: String
+  ) -> [String: Any] {
+    var result = originalResult
+    if result["resultType"] == nil {
+      result["resultType"] = "complete"
+    }
+
+    guard cacheableMethods.contains(method),
+      result["resultType"] as? String == "complete"
+    else {
+      return result
+    }
+    if result["ttlMs"] == nil {
+      result["ttlMs"] = 0
+    }
+    if result["cacheScope"] == nil {
+      result["cacheScope"] = "private"
+    }
+    return result
+  }
+}
+
 extension MCPSessionRegistry {
   func extractSessionID(from request: HTTPRequest) -> String? {
     if let header = request.header(HTTPHeaderName.sessionID), !header.isEmpty {
@@ -33,6 +67,15 @@ extension MCPSessionRegistry {
       return false
     }
     return object["method"] as? String == "server/discover"
+  }
+
+  func modernMethod(in request: HTTPRequest) -> String? {
+    guard let body = request.body,
+      let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
+    else {
+      return nil
+    }
+    return object["method"] as? String
   }
 
   func isModernRequest(_ request: HTTPRequest) -> Bool {
@@ -82,8 +125,9 @@ extension MCPSessionRegistry {
         server: createdServer,
         requestTask: requestTask
       )
+      let method = modernMethod(in: request) ?? ""
       let response = await withTaskCancellationHandler {
-        addingModernServerInfo(to: await requestTask.value)
+        addingModernServerInfo(to: await requestTask.value, method: method)
       } onCancel: {
         requestTask.cancel()
         Task { await createdServer.stop() }
@@ -196,13 +240,14 @@ extension MCPSessionRegistry {
     .error(statusCode: 400, .serverError(code: -32_020, message: message))
   }
 
-  func addingModernServerInfo(to response: HTTPResponse) -> HTTPResponse {
+  func addingModernServerInfo(to response: HTTPResponse, method: String) -> HTTPResponse {
     guard case .data(let data, let headers) = response,
       var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
       var result = object["result"] as? [String: Any]
     else {
       return response
     }
+    result = MCPModernResponseMetadata.addingRequiredFields(to: result, method: method)
     var metadata = result["_meta"] as? [String: Any] ?? [:]
     metadata["io.modelcontextprotocol/serverInfo"] = [
       "name": "Codex Bridge",
@@ -228,7 +273,7 @@ extension MCPSessionRegistry {
       await discoveryInstructionsProvider?(clientID)
       ?? "Codex Bridge exposes locally registered projects and Codex tasks. All actions are "
       + "executed on the user's machine after local approval."
-    let result: [String: Any] = [
+    var result: [String: Any] = [
       "resultType": "complete",
       "supportedVersions": [Self.modernProtocolVersion, Version.latest],
       "capabilities": ["tools": [:], "resources": [:]],
@@ -240,6 +285,7 @@ extension MCPSessionRegistry {
       ],
       "instructions": instructions,
     ]
+    result = MCPModernResponseMetadata.addingRequiredFields(to: result, method: "server/discover")
     let response: [String: Any] = [
       "jsonrpc": "2.0",
       "id": id,

@@ -208,7 +208,9 @@ final class MCPModernResponseRouteTests: XCTestCase, @unchecked Sendable {
     XCTAssertNil(response["result"])
     let error = try XCTUnwrap(response["error"] as? [String: Any])
     XCTAssertEqual(error["code"] as? Int, -32_602)
-    XCTAssertEqual(error["message"] as? String, "Synthetic invalid resource URI")
+    XCTAssertEqual(error["message"] as? String, "Invalid params: Synthetic invalid resource URI")
+    let errorData = try XCTUnwrap(error["data"] as? [String: Any])
+    XCTAssertEqual(errorData["detail"] as? String, "Synthetic invalid resource URI")
   }
 
   func testLegacySessionToolsListUsesOriginalSSEPathWithoutModernHints() async throws {

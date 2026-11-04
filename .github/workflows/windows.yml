@@ -384,24 +384,130 @@ jobs:
           $swiftArguments = @($baseArguments) + @("-c", "debug", "--filter", "MCPModernResponse")
           $swiftOutput = @(& swift test @swiftArguments 2>&1)
           $swiftExitCode = $LASTEXITCODE
-          foreach ($line in $swiftOutput) {
-            $text = [string]$line
-            if ($text -match "Test Case '-\[[^\]]+ ([^\]]+)\]' (started|passed|failed)") {
-              Write-Output ("TEST name={0} status={1}" -f $Matches[1], $Matches[2])
+          function ConvertTo-TestLabel {
+            param([string]$Identity)
+            $match = [regex]::Match($Identity.Trim(), '^(?:-\[)?(?<suite>[A-Za-z0-9_.$]+)[ ./](?<method>test[A-Za-z0-9_]+)(?:\(\))?\]?$')
+            if ($match.Success) {
+              $suite = ($match.Groups["suite"].Value -split "\.")[-1]
+              return "$suite.$($match.Groups["method"].Value)"
+            }
+            $method = [regex]::Match($Identity, '\btest[A-Za-z0-9_]+\b')
+            if ($method.Success) { return $method.Value }
+            return "unparsed_test_identity"
+          }
+          function Get-SourceLocation {
+            param([string]$SourcePath, [string]$SourceLine, [string]$SourceColumn)
+            try {
+              $trimChars = [char[]]@([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+              $workspaceRoot = [System.IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd($trimChars)
+              $fullPath = [System.IO.Path]::GetFullPath($SourcePath)
+              $workspacePrefix = $workspaceRoot + [System.IO.Path]::DirectorySeparatorChar
+              if ($fullPath.StartsWith($workspacePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $relativePath = $fullPath.Substring($workspacePrefix.Length).Replace('\', '/')
+              } else {
+                $relativePath = [System.IO.Path]::GetFileName($fullPath)
+              }
+              if ($relativePath -notmatch '\.swift$') { $relativePath = '<source>' }
+              $position = $SourceLine
+              if ($SourceColumn) { $position += ':' + $SourceColumn }
+              return $relativePath + ':' + $position
+            } catch {
+              $position = $SourceLine
+              if ($SourceColumn) { $position += ':' + $SourceColumn }
+              return '<source>:' + $position
             }
           }
+          function Get-SafeCompilerMessage {
+            param([string]$Message)
+            $safeMessage = $Message.Trim()
+            $safeMessage = [regex]::Replace($safeMessage, '(?i)github_pat_[A-Za-z0-9_]{20,}|\bgh[pousr]_[A-Za-z0-9]{20,}\b|\bsk-[A-Za-z0-9]{20,}\b', '<redacted>')
+            $safeMessage = [regex]::Replace($safeMessage, '(?i)\bBearer\s+\S+', 'Bearer <redacted>')
+            $safeMessage = [regex]::Replace($safeMessage, '(?i)\b(Runtime[_ -]?Key|api[_ -]?key|token|cookie)\b\s*[:=]\s*\S+', '$1=<redacted>')
+            $safeMessage = [regex]::Replace($safeMessage, '(?i)(?:[A-Z]:[\\/]|\\\\)[^\r\n]+|/(?:Users|home)/[^\r\n]+', '<path>')
+            if ($safeMessage.Length -gt 240) { $safeMessage = $safeMessage.Substring(0, 240) }
+            return $safeMessage
+          }
+          $currentTestName = "unknown_test"
+          $sawTestOutput = $false
+          $assertionDiagnosticCount = 0
+          $uncaughtTestErrorCount = 0
+          $compilerDiagnosticCount = 0
+          foreach ($line in $swiftOutput) {
+            $text = [regex]::Replace([string]$line, '\x1B\[[0-?]*[ -/]*[@-~]', '')
+            if ($text -match 'Test (Suite|Case) ') { $sawTestOutput = $true }
+            $caseMatch = [regex]::Match($text, "Test Case '([^']+)' (started|passed|failed)\b")
+            if ($caseMatch.Success) {
+              $testName = ConvertTo-TestLabel -Identity $caseMatch.Groups[1].Value
+              $testStatus = $caseMatch.Groups[2].Value
+              if ($testStatus -eq "started") {
+                $currentTestName = $testName
+              } else {
+                Write-Output ("TEST name={0} status={1}" -f $testName, $testStatus)
+                if ($testStatus -eq "failed") { $currentTestName = $testName }
+                else { $currentTestName = "unknown_test" }
+              }
+            }
+            $diagnosticMatch = [regex]::Match($text, '^(?<path>.+?):(?<line>\d+)(?::(?<column>\d+))?:\s*error:\s*(?<message>.*)$')
+            if ($diagnosticMatch.Success) {
+              $message = $diagnosticMatch.Groups["message"].Value
+              $source = Get-SourceLocation -SourcePath $diagnosticMatch.Groups["path"].Value -SourceLine $diagnosticMatch.Groups["line"].Value -SourceColumn $diagnosticMatch.Groups["column"].Value
+              $assertionMatch = [regex]::Match($message, '\b(?<assertion>XCTAssert[A-Za-z]+|XCTUnwrap|XCTFail)\b')
+              if ($assertionMatch.Success) {
+                $testName = $currentTestName
+                $identityMatch = [regex]::Match($message, '^(?<identity>.+?)\s*:\s*(?:XCTAssert[A-Za-z]+|XCTUnwrap|XCTFail)\b')
+                if ($identityMatch.Success) { $testName = ConvertTo-TestLabel -Identity $identityMatch.Groups["identity"].Value }
+                $assertion = $assertionMatch.Groups["assertion"].Value
+                $reason = switch ($assertion) {
+                  "XCTAssertEqual" { "equality_mismatch"; break }
+                  "XCTAssertNotEqual" { "unexpected_equality"; break }
+                  "XCTAssertNil" { "expected_nil"; break }
+                  "XCTAssertNotNil" { "expected_non_nil"; break }
+                  "XCTAssertTrue" { "expected_true"; break }
+                  "XCTAssertFalse" { "expected_false"; break }
+                  "XCTUnwrap" { "unexpected_nil"; break }
+                  "XCTFail" { "explicit_failure"; break }
+                  default { "assertion_failed" }
+                }
+                Write-Output ("TEST_DIAGNOSTIC test={0} source={1} category=xctest_assertion assertion={2} reason={3} values=redacted" -f $testName, $source, $assertion, $reason)
+                $assertionDiagnosticCount++
+              } elseif (-not $sawTestOutput) {
+                $compilerDiagnosticCount++
+                $compilerCategory = "swift_compiler_error"
+                if ($message -match 'no such module') { $compilerCategory = "swift_no_such_module" }
+                elseif ($message -match 'cannot find') { $compilerCategory = "swift_symbol_not_found" }
+                elseif ($message -match 'failed to build module') { $compilerCategory = "swift_module_build_failure" }
+                $safeMessage = Get-SafeCompilerMessage -Message $message
+                Write-Output ("COMPILER_DIAGNOSTIC source={0} category={1} message={2}" -f $source, $compilerCategory, $safeMessage)
+              } else {
+                Write-Output ("TEST_DIAGNOSTIC test={0} source={1} category=xctest_error reason=uncaught_test_error" -f $currentTestName, $source)
+                $uncaughtTestErrorCount++
+              }
+            } elseif ($text -match '^\s*error:\s*(?<message>.*)$') {
+              if ($sawTestOutput) {
+                Write-Output ("TEST_DIAGNOSTIC test={0} source=<location-unavailable> category=xctest_error reason=unhandled_test_error" -f $currentTestName)
+                $uncaughtTestErrorCount++
+              } else {
+                $compilerDiagnosticCount++
+                $safeMessage = Get-SafeCompilerMessage -Message $Matches["message"]
+                Write-Output ("COMPILER_DIAGNOSTIC source=<location-unavailable> category=swift_compiler_error message={0}" -f $safeMessage)
+              }
+            }
+          }
+          Write-Output ("DIAGNOSTIC_SUMMARY assertions={0} test_errors={1} compiler_errors={2}" -f $assertionDiagnosticCount, $uncaughtTestErrorCount, $compilerDiagnosticCount)
           $summaryLine = $swiftOutput | Where-Object { [string]$_ -match "Executed \d+ tests?, with \d+ failures?" } | Select-Object -Last 1
           $summaryText = [string]$summaryLine
           $summaryMatch = [regex]::Match($summaryText, 'Executed (\d+) tests?, with (\d+) failures?')
           if (-not $summaryLine -or -not $summaryMatch.Success) {
             Write-Output "ERROR_CATEGORY=swift_test_summary_missing"
+            if ($swiftExitCode -ne 0) { exit $swiftExitCode }
             exit 1
           }
           $executed = [int]$summaryMatch.Groups[1].Value
           $failures = [int]$summaryMatch.Groups[2].Value
           Write-Output "TEST_SUMMARY executed=$executed failures=$failures"
           if ($swiftExitCode -ne 0) {
-            Write-Output "ERROR_CATEGORY=swift_test_command_failed"
+            if ($failures -gt 0) { Write-Output "ERROR_CATEGORY=swift_test_assertion_failure" }
+            else { Write-Output "ERROR_CATEGORY=swift_test_command_failed" }
             exit $swiftExitCode
           }
           if ($executed -lt 11) {

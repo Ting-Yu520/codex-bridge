@@ -21,6 +21,7 @@ concurrency:
 
 jobs:
   build:
+    if: github.ref != 'refs/heads/ci/mcp-cache-hints-route-tests-20261104'
     name: build (${{ matrix.architecture }})
     runs-on: ${{ matrix.architecture == 'arm64' && 'windows-11-arm' || 'windows-latest' }}
     env:
@@ -319,3 +320,117 @@ jobs:
             .build/windows-installer/${{ matrix.architecture }}/*-Setup.exe.sha256
             .build/windows-installer/${{ matrix.architecture }}/INSTALLER-BUILD-INFO.json
           if-no-files-found: error
+
+  # Temporary regression job, gated to this branch and manual x64 dispatch only.
+  mcp-route-tests:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/ci/mcp-cache-hints-route-tests-20261104' && inputs.architecture == 'x64'
+    name: MCP route regression (x64)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      SWIFT_VERSION: 6.3.3
+      TARGET_TRIPLE: x86_64-unknown-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Swift toolchain
+        shell: pwsh
+        run: '& "$env:GITHUB_WORKSPACE\.github\scripts\setup-windows-swift.ps1" -Version $env:SWIFT_VERSION'
+      - name: Prepare Windows Swift test libraries
+        shell: pwsh
+        run: |
+          if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -ne "X64") {
+            throw "The MCP route test job requires a Windows x64 runner."
+          }
+          $triplet = "x64-windows"
+          $vcpkgRoot = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\$triplet"
+          $vcpkgOutput = & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install "sqlite3:$triplet" 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "ERROR_CATEGORY=vcpkg_sqlite_setup"
+            exit 1
+          }
+          . "$env:GITHUB_WORKSPACE\Scripts\windows-build-environment.ps1"
+          $buildEnvironment = Get-WindowsBuildEnvironment -Architecture "x64"
+          $includePaths = @((Join-Path $vcpkgRoot "include")) + $buildEnvironment.IncludePaths
+          $libraryPaths = @((Join-Path $vcpkgRoot "lib")) + $buildEnvironment.LibraryPaths
+          Add-Content $env:GITHUB_ENV "INCLUDE=$($includePaths -join ';')"
+          Add-Content $env:GITHUB_ENV "TARGET_LIBRARY_PATHS=$($libraryPaths -join ';')"
+          Add-Content $env:GITHUB_ENV "LIB=$($libraryPaths -join ';')"
+          Add-Content $env:GITHUB_PATH (Join-Path $vcpkgRoot "bin")
+          Write-Output "WINDOWS_TEST_LIBRARY_SETUP=PASS"
+      - name: Resolve pinned SwiftPM dependencies
+        shell: pwsh
+        run: |
+          $resolveOutput = & swift package --package-path Packages/BridgeCore resolve 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "ERROR_CATEGORY=swift_dependency_resolution"
+            exit 1
+          }
+          Write-Output "SWIFTPM_RESOLVE_STATUS=PASS"
+      - name: Set temporary MCP response capture directory
+        shell: pwsh
+        run: |
+          $captureDirectory = Join-Path $env:RUNNER_TEMP "codex-bridge-mcp-captures"
+          New-Item -ItemType Directory -Path $captureDirectory -Force | Out-Null
+          Add-Content $env:GITHUB_ENV "CODEX_BRIDGE_MCP_CAPTURE_DIR=$captureDirectory"
+          Write-Output "CAPTURE_STORAGE=runner-temp-only"
+      - name: Run discovered Swift MCP route tests
+        working-directory: Packages/BridgeCore
+        shell: pwsh
+        run: |
+          . "$env:GITHUB_WORKSPACE\Scripts\windows-swift-arguments.ps1"
+          $baseArguments = Get-WindowsSwiftArguments -VcpkgInstalledRoot "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows" -TargetTriple $env:TARGET_TRIPLE -LibraryPaths ($env:TARGET_LIBRARY_PATHS -split ";")
+          $swiftArguments = @($baseArguments) + @("-c", "debug", "--filter", "MCPModernResponse")
+          $swiftOutput = @(& swift test @swiftArguments 2>&1)
+          $swiftExitCode = $LASTEXITCODE
+          foreach ($line in $swiftOutput) {
+            $text = [string]$line
+            if ($text -match "Test Case '-\[[^\]]+ ([^\]]+)\]' (started|passed|failed)") {
+              Write-Output ("TEST name={0} status={1}" -f $Matches[1], $Matches[2])
+            }
+          }
+          $summaryLine = $swiftOutput | Where-Object { [string]$_ -match "Executed \d+ tests?, with \d+ failures?" } | Select-Object -Last 1
+          $summaryText = [string]$summaryLine
+          $summaryMatch = [regex]::Match($summaryText, 'Executed (\d+) tests?, with (\d+) failures?')
+          if (-not $summaryLine -or -not $summaryMatch.Success) {
+            Write-Output "ERROR_CATEGORY=swift_test_summary_missing"
+            exit 1
+          }
+          $executed = [int]$summaryMatch.Groups[1].Value
+          $failures = [int]$summaryMatch.Groups[2].Value
+          Write-Output "TEST_SUMMARY executed=$executed failures=$failures"
+          if ($swiftExitCode -ne 0) {
+            Write-Output "ERROR_CATEGORY=swift_test_command_failed"
+            exit $swiftExitCode
+          }
+          if ($executed -lt 11) {
+            Write-Output "ERROR_CATEGORY=swift_test_discovery_or_zero_tests"
+            exit 1
+          }
+          if ($failures -ne 0) {
+            Write-Output "ERROR_CATEGORY=swift_test_assertion_failure"
+            exit 1
+          }
+          Write-Output "SWIFT_TEST_STATUS=PASS"
+      - name: Set up Python for Schema validation
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13.11"
+      - name: Install pinned Schema validator
+        shell: pwsh
+        run: |
+          $pipOutput = & python -m pip install --disable-pip-version-check --no-input --only-binary=:all: -r .github/ci/mcp-schema-requirements.txt 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "ERROR_CATEGORY=schema_dependency_install"
+            exit 1
+          }
+          Write-Output "SCHEMA_VALIDATOR_SETUP=PASS"
+      - name: Validate actual captured MCP route responses
+        shell: pwsh
+        run: |
+          & python .github/scripts/validate-mcp-route-captures.py
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "ERROR_CATEGORY=actual_route_schema_validation"
+            exit $LASTEXITCODE
+          }

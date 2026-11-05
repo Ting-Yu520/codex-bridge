@@ -417,7 +417,12 @@ let package = Package(
     
     .testTarget(
       name: "BridgeMCPTests",
-      dependencies: ["BridgeMCP", .product(name: "MCP", package: "swift-sdk")],
+      dependencies: [
+        "BridgeIPC",
+        "BridgeLegacyImport",
+        "BridgeMCP",
+        .product(name: "MCP", package: "swift-sdk"),
+      ],
       path: "Tests/BridgeMCPTests"
     ),
   ] + macOSOnlyTargets + linuxOnlyTargets

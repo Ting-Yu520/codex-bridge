@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   build:
-    if: github.ref != 'refs/heads/ci/mcp-cache-hints-route-tests-20261104'
+    if: github.ref != 'refs/heads/ci/mcp-cache-hints-route-tests-20261104' && github.ref != 'refs/heads/ci/mcp-cache-hints-exe-process-20261105'
     name: build (${{ matrix.architecture }})
     runs-on: ${{ matrix.architecture == 'arm64' && 'windows-11-arm' || 'windows-latest' }}
     env:
@@ -540,3 +540,129 @@ jobs:
             Write-Output "ERROR_CATEGORY=actual_route_schema_validation"
             exit $LASTEXITCODE
           }
+
+  # Gate B1 only: run the verified Windows service EXE in an isolated hosted runner.
+  mcp-exe-process-tests:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/ci/mcp-cache-hints-exe-process-20261105' && inputs.architecture == 'x64'
+    name: MCP executable process regression (x64)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+    env:
+      SWIFT_VERSION: 6.3.3
+      TARGET_TRIPLE: x86_64-unknown-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify isolated Windows x64 runner
+        shell: pwsh
+        run: |
+          if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -ne "X64" -or
+              -not [Environment]::Is64BitProcess) {
+            Write-Output "ERROR_CATEGORY=runner_not_windows_x64"
+            exit 1
+          }
+          $existing = @(Get-Process -ErrorAction Stop | Where-Object {
+            $_.ProcessName -match '^(codex[-_.]?bridge|tunnel-client)'
+          })
+          if ($existing.Count -gt 0) {
+            Write-Output "ERROR_CATEGORY=existing_bridge_process"
+            exit 1
+          }
+          try {
+            $pipes = @(Get-ChildItem -LiteralPath "\\.\pipe\" -ErrorAction Stop)
+          } catch {
+            Write-Output "ERROR_CATEGORY=named_pipe_namespace_unavailable"
+            exit 1
+          }
+          $bridgePipes = @($pipes | Where-Object { $_.Name -match '^org\.codexbridge\.service\.' })
+          if ($bridgePipes.Count -gt 0) {
+            Write-Output "ERROR_CATEGORY=existing_bridge_ipc_endpoint"
+            exit 1
+          }
+          $appSupport = [Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)
+          if ([string]::IsNullOrWhiteSpace($appSupport) -or (Test-Path -LiteralPath (Join-Path $appSupport "CodexBridge"))) {
+            Write-Output "ERROR_CATEGORY=legacy_configuration_present_or_unavailable"
+            exit 1
+          }
+          $credentialTargets = @(& "$env:SystemRoot\System32\cmdkey.exe" /list 2>$null | ForEach-Object {
+            if ([string]$_ -match '^\s*Target:\s*(?<target>.+)$') { $Matches.target.Trim() }
+          })
+          if ($LASTEXITCODE -ne 0 -or ($credentialTargets -match 'com\.openai\.codex-bridge\.secrets')) {
+            Write-Output "ERROR_CATEGORY=preexisting_bridge_credential_target"
+            exit 1
+          }
+          Write-Output "PASS test=runner-preflight architecture=x64 bridge_processes=0 bridge_pipes=0 legacy_root=absent"
+      - name: Install Swift toolchain
+        shell: pwsh
+        run: '& "$env:GITHUB_WORKSPACE\.github\scripts\setup-windows-swift.ps1" -Version $env:SWIFT_VERSION'
+      - name: Prepare Windows Swift test libraries
+        shell: pwsh
+        run: |
+          $triplet = "x64-windows"
+          $vcpkgRoot = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\$triplet"
+          $vcpkgOutput = & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install "sqlite3:$triplet" 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "ERROR_CATEGORY=vcpkg_sqlite_setup"
+            exit 1
+          }
+          . "$env:GITHUB_WORKSPACE\Scripts\windows-build-environment.ps1"
+          $buildEnvironment = Get-WindowsBuildEnvironment -Architecture "x64"
+          $includePaths = @((Join-Path $vcpkgRoot "include")) + $buildEnvironment.IncludePaths
+          $libraryPaths = @((Join-Path $vcpkgRoot "lib")) + $buildEnvironment.LibraryPaths
+          Add-Content $env:GITHUB_ENV "INCLUDE=$($includePaths -join ';')"
+          Add-Content $env:GITHUB_ENV "TARGET_LIBRARY_PATHS=$($libraryPaths -join ';')"
+          Add-Content $env:GITHUB_ENV "LIB=$($libraryPaths -join ';')"
+          Add-Content $env:GITHUB_PATH (Join-Path $vcpkgRoot "bin")
+          Write-Output "PASS test=windows-swift-test-libraries architecture=x64"
+      - name: Resolve pinned SwiftPM dependencies
+        shell: pwsh
+        run: |
+          $resolveOutput = & swift package --package-path Packages/BridgeCore resolve 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "ERROR_CATEGORY=swift_dependency_resolution"
+            exit 1
+          }
+          Write-Output "PASS test=swiftpm-resolve"
+      - name: Download and verify approved portable build
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: '& "$env:GITHUB_WORKSPACE\.github\scripts\prepare-mcp-process-artifact.ps1"'
+      - name: Apply and verify candidate egress isolation
+        shell: pwsh
+        run: '& "$env:GITHUB_WORKSPACE\.github\scripts\guard-mcp-exe-egress.ps1" -Mode Apply'
+      - name: Run Windows EXE process-level XCTest
+        working-directory: Packages/BridgeCore
+        timeout-minutes: 35
+        shell: pwsh
+        run: '& "$env:GITHUB_WORKSPACE\.github\scripts\invoke-mcp-exe-process-tests.ps1"'
+      - name: Set up Python for fixed MCP Schema validation
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13.11"
+      - name: Install pinned Schema validator
+        shell: pwsh
+        run: |
+          $pipOutput = & python -m pip install --disable-pip-version-check --no-input --only-binary=:all: -r .github/ci/mcp-schema-requirements.txt 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "ERROR_CATEGORY=schema_dependency_install"
+            exit 1
+          }
+          Write-Output "PASS test=schema-validator-setup"
+      - name: Validate actual EXE MCP responses against fixed Schema
+        shell: pwsh
+        run: |
+          & python .github/scripts/validate-mcp-process-captures.py
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "ERROR_CATEGORY=actual_process_schema_validation"
+            exit $LASTEXITCODE
+          }
+      - name: Stop only the verified candidate and restore runner guard
+        if: always()
+        timeout-minutes: 5
+        shell: pwsh
+        run: '& "$env:GITHUB_WORKSPACE\.github\scripts\guard-mcp-exe-egress.ps1" -Mode Cleanup'

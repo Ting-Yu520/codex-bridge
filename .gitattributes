@@ -2,3 +2,4 @@
 Packages/BridgeCore/Sources/BridgePiRPC/Resources/** -text
 Packages/BridgeCore/Sources/BridgeQoderSDK/Resources/** -text
 Packages/BridgeCore/Sources/BridgeDeepSeekHarnessDesktop/Resources/** -text
+.github/schemas/mcp-2026-07-28.json -text

@@ -541,7 +541,7 @@ jobs:
             exit $LASTEXITCODE
           }
 
-  # Gate B1 only: run the verified Windows service EXE in an isolated hosted runner.
+  # Gate B1 only: hosted checks cover L1/L2; block Service launch unless L4 is proven.
   mcp-exe-process-tests:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/ci/mcp-cache-hints-exe-process-20261105' && inputs.architecture == 'x64'
     name: MCP executable process regression (x64)
@@ -557,7 +557,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Verify isolated Windows x64 runner
+      - name: Run synthetic egress recovery state tests
+        shell: pwsh
+        run: '& "$env:GITHUB_WORKSPACE\.github\scripts\tests\Test-McpEgressGuardRecovery.ps1"'
+      - name: Verify fresh Windows x64 runner
         shell: pwsh
         run: |
           if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -ne "X64" -or
@@ -632,10 +635,31 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: '& "$env:GITHUB_WORKSPACE\.github\scripts\prepare-mcp-process-artifact.ps1"'
-      - name: Apply and verify candidate egress isolation
+      - name: Verify path firewall rules and independent probe (L1-L2)
         shell: pwsh
         run: '& "$env:GITHUB_WORKSPACE\.github\scripts\guard-mcp-exe-egress.ps1" -Mode Apply'
+      - name: Require process-tree egress isolation before Service launch
+        if: always()
+        shell: pwsh
+        run: |
+          $statePath = Join-Path $env:RUNNER_TEMP "codex-bridge-b1-egress-state.json"
+          if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+            Write-Output "BLOCKED stage=service-start error_category=recovery_state_missing"
+            exit 1
+          }
+          try {
+            $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -AsHashtable
+          } catch {
+            Write-Output "BLOCKED stage=service-start error_category=recovery_state_invalid"
+            exit 1
+          }
+          if ($state.network.levels.L4 -ne "PASS" -or $state.network.serviceStartAllowed -ne $true) {
+            Write-Output "BLOCKED stage=service-start error_category=process_tree_egress_isolation_unavailable"
+            exit 1
+          }
+          Write-Output "PASS stage=service-start security_level=L4"
       - name: Run Windows EXE process-level XCTest
+        if: success() && env.CODEX_BRIDGE_B1_ISOLATION_LEVEL == 'L4_PASS'
         working-directory: Packages/BridgeCore
         timeout-minutes: 35
         shell: pwsh
@@ -654,6 +678,7 @@ jobs:
           }
           Write-Output "PASS test=schema-validator-setup"
       - name: Validate actual EXE MCP responses against fixed Schema
+        if: success() && env.CODEX_BRIDGE_B1_ISOLATION_LEVEL == 'L4_PASS'
         shell: pwsh
         run: |
           & python .github/scripts/validate-mcp-process-captures.py

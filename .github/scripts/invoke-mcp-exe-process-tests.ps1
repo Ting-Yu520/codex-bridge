@@ -14,6 +14,24 @@ try {
   if (-not $env:RUNNER_TEMP -or -not $env:TARGET_TRIPLE -or -not $env:VCPKG_INSTALLATION_ROOT) {
     throw "test_environment_missing"
   }
+  $securityStatePath = Join-Path $env:RUNNER_TEMP "codex-bridge-b1-egress-state.json"
+  if (-not (Test-Path -LiteralPath $securityStatePath -PathType Leaf)) {
+    Write-Output "BLOCKED stage=service-start error_category=security_state_missing"
+    exit 1
+  }
+  try {
+    $securityState = Get-Content -LiteralPath $securityStatePath -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable
+  } catch {
+    Write-Output "BLOCKED stage=service-start error_category=security_state_invalid"
+    exit 1
+  }
+  if ($securityState.schema -ne "codex-bridge-b1-egress-recovery/v2" -or
+      $securityState.network.levels.L4 -ne "PASS" -or
+      $securityState.network.serviceStartAllowed -ne $true -or
+      $securityState.phase -ne "guard-active") {
+    Write-Output "BLOCKED stage=service-start error_category=process_tree_egress_isolation_unavailable"
+    exit 1
+  }
   foreach ($name in @(
     "GITHUB_TOKEN", "GH_TOKEN", "ACTIONS_RUNTIME_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
     "OPENAI_API_KEY", "CODEX_BRIDGE_RUNTIME_KEY", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",

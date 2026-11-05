@@ -60,6 +60,25 @@ def main() -> int:
     capture_dir = Path(capture_value).resolve()
     if capture_dir.parent != runner_temp:
         return fail("capture_directory_outside_runner_temp")
+
+    security_state_path = runner_temp / "codex-bridge-b1-egress-state.json"
+    if not security_state_path.is_file():
+        return fail("security_state_missing", name="mcp-process-security-gate")
+    try:
+        security_state = json.loads(security_state_path.read_bytes())
+        levels = security_state["network"]["levels"]
+        security_ready = (
+            security_state.get("schema") == "codex-bridge-b1-egress-recovery/v2"
+            and security_state.get("phase") == "guard-active"
+            and levels.get("L4") == "PASS"
+            and security_state["network"].get("serviceStartAllowed") is True
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
+        return fail("security_state_invalid", name="mcp-process-security-gate")
+    if not security_ready:
+        return fail("process_tree_egress_isolation_unavailable", name="mcp-process-security-gate")
+    print("PASS test=mcp-process-security-gate isolation_level=L4")
+
     if not SCHEMA_PATH.is_file():
         return fail("pinned_schema_missing")
 

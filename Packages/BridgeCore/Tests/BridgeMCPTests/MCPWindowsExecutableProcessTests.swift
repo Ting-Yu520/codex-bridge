@@ -5,6 +5,7 @@ import XCTest
 @testable import BridgeIPC
 
 #if os(Windows)
+  import FoundationNetworking
   import WinSDK
 
   private enum MCPProcessHarnessError: Error {

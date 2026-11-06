@@ -5,6 +5,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+Import-Module (Join-Path $PSScriptRoot "SwiftToolchainIdentity.psm1") -Force
 
 $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 $platform = switch ($architecture) {
@@ -36,8 +37,8 @@ $swiftExe = ($candidates | Where-Object { $_ -notmatch '\+Asserts' } |
   Select-Object -First 1)
 if (-not $swiftExe) { $swiftExe = $candidates | Select-Object -First 1 }
 if (-not $swiftExe) { throw "swift.exe not found after install" }
-Write-Host "found swift at $swiftExe"
-$swiftBin = Split-Path $swiftExe
+$swiftExeFull = (Get-Item -LiteralPath $swiftExe -ErrorAction Stop).FullName
+$swiftBin = Split-Path $swiftExeFull
 Add-Content $env:GITHUB_PATH $swiftBin
 $toolchainVersionDirectory = (Get-Item $swiftBin).Parent.Parent
 if (-not $toolchainVersionDirectory -or
@@ -45,6 +46,11 @@ if (-not $toolchainVersionDirectory -or
   throw "Swift toolchain version directory was not found."
 }
 $swiftRoot = $toolchainVersionDirectory.Parent.Parent.FullName
+$toolchainVariant = $toolchainVersionDirectory.Name
+$allowedVariants = @($Version, "$Version+Asserts")
+if ($toolchainVariant -notin $allowedVariants) {
+  throw "Swift toolchain variant did not match requested version."
+}
 $sdkVersion = $toolchainVersionDirectory.Name -replace "\+.*$", ""
 if ($sdkVersion -ne $Version) { throw "Expected Swift $Version, found $sdkVersion" }
 # The host runtime is separate from the toolchain and must be on PATH.
@@ -52,7 +58,7 @@ $runtimeBin = Join-Path $swiftRoot "Runtimes\$sdkVersion\usr\bin"
 if (-not (Test-Path (Join-Path $runtimeBin "swiftCore.dll"))) {
   throw "Version-matching swiftCore.dll was not found after install."
 }
-Write-Host "found runtime at $runtimeBin"
+Write-Host "found runtime for Swift $sdkVersion"
 Add-Content $env:GITHUB_PATH $runtimeBin
 # The installer ships a version-matched Windows SDK separately from
 # the toolchain. Installer environment changes do not reach an
@@ -62,5 +68,8 @@ $sdkRoot = Join-Path $platformDir "Developer\SDKs\Windows.sdk"
 if (-not (Test-Path -LiteralPath $sdkRoot -PathType Container)) {
   throw "Version-matching Swift Windows SDK was not found."
 }
-Write-Host "SDKROOT=$sdkRoot"
 Add-Content $env:GITHUB_ENV "SDKROOT=$sdkRoot"
+$swiftPathId = Get-SwiftToolchainPathId -Path $swiftExeFull
+Write-Host "found swift variant=$toolchainVariant path_id=sha256:$swiftPathId"
+Add-Content $env:GITHUB_ENV "SWIFT_EXE_PATH=$swiftExeFull"
+Add-Content $env:GITHUB_ENV "SWIFT_TOOLCHAIN_VARIANT=$toolchainVariant"

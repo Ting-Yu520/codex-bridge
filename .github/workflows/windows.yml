@@ -792,14 +792,104 @@ jobs:
       - name: Record Swift toolchain input identity
         shell: pwsh
         run: |
-          $versionLine = @(& swift --version 2>&1 | Select-Object -First 1)
-          if ($LASTEXITCODE -ne 0 -or $versionLine.Count -ne 1 -or $versionLine[0] -notmatch 'Swift version 6\.3\.3\b') {
-            throw "swift_toolchain_version_unverified"
+          $ErrorActionPreference = 'Stop'
+          Import-Module "$env:GITHUB_WORKSPACE\.github\scripts\SwiftToolchainIdentity.psm1" -Force
+          $swiftExe = $env:SWIFT_EXE_PATH
+          $toolchainVariant = $env:SWIFT_TOOLCHAIN_VARIANT
+          $pathId = 'unavailable'
+          $exitCode = $null
+          $capturedOutput = @()
+          $process = $null
+          $executionFailed = $false
+          $timedOut = $false
+          $timeoutCleanup = 'not_required'
+          $startedProcessId = $null
+          $startedProcessStartTimeUtcTicks = $null
+
+          try {
+            if ([string]::IsNullOrWhiteSpace($swiftExe) -or
+                -not (Test-Path -LiteralPath $swiftExe -PathType Leaf)) {
+              throw 'swift_executable_missing'
+            }
+            $swiftExe = (Get-Item -LiteralPath $swiftExe -ErrorAction Stop).FullName
+            $pathId = Get-SwiftToolchainPathId -Path $swiftExe
+            $startInfo = [Diagnostics.ProcessStartInfo]::new()
+            $startInfo.FileName = $swiftExe
+            [void]$startInfo.ArgumentList.Add('--version')
+            $startInfo.WorkingDirectory = Split-Path -Parent $swiftExe
+            $startInfo.UseShellExecute = $false
+            $startInfo.CreateNoWindow = $true
+            $startInfo.RedirectStandardOutput = $true
+            $startInfo.RedirectStandardError = $true
+            $process = [Diagnostics.Process]::new()
+            $process.StartInfo = $startInfo
+            if (-not $process.Start()) { throw 'swift_process_start_failed' }
+            $startedProcessId = $process.Id
+            $startedProcessStartTimeUtcTicks = $process.StartTime.ToUniversalTime().Ticks
+            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+            $stderrTask = $process.StandardError.ReadToEndAsync()
+            if (-not $process.WaitForExit(30000)) {
+              $timedOut = $true
+              $timeoutCleanup = 'BLOCKED'
+              $process.Refresh()
+              if ($process.HasExited) {
+                if (-not $process.WaitForExit(5000)) { throw 'swift_timeout_exit_confirmation_failed' }
+                $timeoutCleanup = 'not_required'
+              } else {
+                $actualImagePath = [IO.Path]::GetFullPath($process.MainModule.FileName)
+                $actualStartTimeUtcTicks = $process.StartTime.ToUniversalTime().Ticks
+                $expectedImagePath = [IO.Path]::GetFullPath($swiftExe)
+                if ($process.Id -ne $startedProcessId -or
+                    $actualStartTimeUtcTicks -ne $startedProcessStartTimeUtcTicks -or
+                    -not [string]::Equals($actualImagePath, $expectedImagePath, [StringComparison]::OrdinalIgnoreCase)) {
+                  throw 'swift_timeout_process_identity_unverified'
+                }
+                $process.Kill()
+                if (-not $process.WaitForExit(5000) -or -not $process.HasExited) {
+                  throw 'swift_timeout_cleanup_failed'
+                }
+                $timeoutCleanup = 'PASS'
+              }
+            }
+            $exitCode = $process.ExitCode
+            $stdout = $stdoutTask.GetAwaiter().GetResult()
+            $stderr = $stderrTask.GetAwaiter().GetResult()
+            foreach ($streamText in @($stdout, $stderr)) {
+              if (-not [string]::IsNullOrEmpty($streamText)) {
+                $capturedOutput += $streamText -split '\r?\n'
+              }
+            }
+            if ($timedOut) { throw 'swift_version_timeout' }
+          } catch {
+            $executionFailed = $true
+          } finally {
+            if ($process) { $process.Dispose() }
           }
+
+          if ($executionFailed) {
+            $assessmentExitCode = if ($null -eq $exitCode) { 1 } else { $exitCode }
+            $reportedExitCode = if ($null -eq $exitCode) { 'unavailable' } else { $exitCode }
+            $assessment = Get-SwiftToolchainVersionAssessment -ExitCode $assessmentExitCode `
+              -Output $capturedOutput -ToolchainVariant $toolchainVariant
+            $failureKind = if ($timedOut) { 'timeout' } else { 'process_start_or_capture' }
+            Write-Output "SWIFT_EXECUTION_FAILED failure_kind=$failureKind timeout_cleanup=$timeoutCleanup exit_code=$reportedExitCode detected_version=$($assessment.detectedVersion) toolchain_variant=$($assessment.toolchainVariant) swift_path_id=$(if ($pathId -eq 'unavailable') { 'unavailable' } else { "sha256:$pathId" })"
+            throw 'swift_toolchain_execution_failed'
+          }
+
+          $assessment = Get-SwiftToolchainVersionAssessment -ExitCode $exitCode `
+            -Output $capturedOutput -ToolchainVariant $toolchainVariant
+          if ($assessment.status -ne 'PASS') {
+            Write-Output "$($assessment.status) exit_code=$exitCode detected_version=$($assessment.detectedVersion) toolchain_variant=$($assessment.toolchainVariant) swift_path_id=sha256:$pathId"
+            throw 'swift_toolchain_identity_failed'
+          }
+
+          Write-Output "PASS test=swift-toolchain version=$($assessment.detectedVersion) toolchain_variant=$($assessment.toolchainVariant) swift_path_id=sha256:$pathId"
           $installerPath = Join-Path $env:RUNNER_TEMP "swift-downloads\swift-6.3.3-windows10.exe"
           if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) { throw "swift_installer_record_missing" }
           $installerHash = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
           Write-Output "PASS test=swift-toolchain version=6.3.3 installer_sha256=$installerHash"
+          Add-Content $env:GITHUB_ENV "SWIFT_TOOLCHAIN_VERIFIED_VERSION=$env:SWIFT_VERSION"
+          Add-Content $env:GITHUB_ENV "SWIFT_TOOLCHAIN_VERIFIED_PATH_ID=$pathId"
       - name: Prepare Windows Swift test libraries
         shell: pwsh
         run: |
@@ -834,13 +924,28 @@ jobs:
       - name: Resolve pinned SwiftPM dependencies
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module "$env:GITHUB_WORKSPACE\.github\scripts\SwiftToolchainIdentity.psm1" -Force
+          $swiftExe = $env:SWIFT_EXE_PATH
+          if ([string]::IsNullOrWhiteSpace($swiftExe) -or
+              -not (Test-Path -LiteralPath $swiftExe -PathType Leaf) -or
+              $env:SWIFT_TOOLCHAIN_VERIFIED_VERSION -cne $env:SWIFT_VERSION -or
+              $env:SWIFT_VERSION -cne '6.3.3') {
+            throw "swift_toolchain_binding_unverified"
+          }
+          $swiftExe = (Get-Item -LiteralPath $swiftExe -ErrorAction Stop).FullName
+          $resolvePathId = Get-SwiftToolchainPathId -Path $swiftExe
+          if ([string]::IsNullOrWhiteSpace($env:SWIFT_TOOLCHAIN_VERIFIED_PATH_ID) -or
+              $resolvePathId -cne $env:SWIFT_TOOLCHAIN_VERIFIED_PATH_ID) {
+            throw "swift_toolchain_path_identity_changed"
+          }
           $lockFiles = @("Packages/BridgeCore/Package.resolved", "Vendor/swift-sdk/Package.resolved")
           $before = @{}
           foreach ($path in $lockFiles) {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "swiftpm_lock_missing" }
             $before[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
           }
-          $resolveOutput = @(& swift package --package-path Packages/BridgeCore resolve --force-resolved-versions 2>&1)
+          $resolveOutput = @(& $swiftExe package --package-path Packages/BridgeCore resolve --force-resolved-versions 2>&1)
           $resolveExitCode = $LASTEXITCODE
           if ($resolveExitCode -ne 0) {
             $resolveOutput | ForEach-Object { Write-Output ([string]$_) }
@@ -858,16 +963,28 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          Import-Module "$env:GITHUB_WORKSPACE\.github\scripts\SwiftToolchainIdentity.psm1" -Force
+          $swiftExe = $env:SWIFT_EXE_PATH
+          if ([string]::IsNullOrWhiteSpace($swiftExe) -or
+              -not (Test-Path -LiteralPath $swiftExe -PathType Leaf) -or
+              $env:SWIFT_TOOLCHAIN_VERIFIED_VERSION -cne $env:SWIFT_VERSION -or
+              $env:SWIFT_VERSION -cne '6.3.3') {
+            throw "swift_toolchain_binding_unverified"
+          }
+          $swiftExe = (Get-Item -LiteralPath $swiftExe -ErrorAction Stop).FullName
+          $compilePathId = Get-SwiftToolchainPathId -Path $swiftExe
+          if ([string]::IsNullOrWhiteSpace($env:SWIFT_TOOLCHAIN_VERIFIED_PATH_ID) -or
+              $compilePathId -cne $env:SWIFT_TOOLCHAIN_VERIFIED_PATH_ID) {
+            throw "swift_toolchain_path_identity_changed"
+          }
           . "$env:GITHUB_WORKSPACE\Scripts\windows-swift-arguments.ps1"
           $baseArguments = @(Get-WindowsSwiftArguments `
             -VcpkgInstalledRoot "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows" `
             -TargetTriple $env:TARGET_TRIPLE `
             -LibraryPaths ($env:TARGET_LIBRARY_PATHS -split ";"))
           $buildArguments = @($baseArguments) + @("-c", "debug", "--build-tests")
-          & swift --version
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Add-Content -LiteralPath $env:GITHUB_OUTPUT 'compile_attempted=true'
-          & swift build @buildArguments
+          & $swiftExe build @buildArguments
           $buildExitCode = $LASTEXITCODE
           $compileStatus = if ($buildExitCode -eq 0) { 'PASS' } else { 'FAIL' }
           Add-Content -LiteralPath $env:GITHUB_OUTPUT "compile_status=$compileStatus"

@@ -9,19 +9,74 @@ on:
     inputs:
       architecture:
         description: Target architecture
+        required: true
         type: choice
         options: [all, x64, arm64]
-        default: all
+      test_mode:
+        description: Test-only mode for isolated validation branches
+        required: true
+        type: choice
+        options: [standard, b1-compile-only]
 permissions:
   contents: read
 
 concurrency:
-  group: windows-${{ github.ref }}-${{ inputs.architecture || 'all' }}
+  group: windows-${{ github.ref }}-${{ inputs.architecture || 'all' }}${{ inputs.test_mode == 'b1-compile-only' && '-compile-only' || '' }}
   cancel-in-progress: true
 
 jobs:
+  dispatch-input-validation:
+    name: Validate workflow dispatch policy
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      build_job: ${{ steps.policy.outputs.build_job }}
+      route_job: ${{ steps.policy.outputs.route_job }}
+      b1_runtime_job: ${{ steps.policy.outputs.b1_runtime_job }}
+      b1_compile_job: ${{ steps.policy.outputs.b1_compile_job }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate event and dispatch inputs
+        id: policy
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_HEAD_REF: ${{ github.head_ref }}
+          EVENT_BASE_REF: ${{ github.base_ref }}
+          TEST_MODE: ${{ inputs.test_mode }}
+          ARCHITECTURE: ${{ inputs.architecture }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module "$env:GITHUB_WORKSPACE\.github\scripts\vm\McpVmWorkflowPolicy.psm1" -Force
+          $decision = Get-CodexBridgeWorkflowDecision `
+            -EventName $env:EVENT_NAME `
+            -Ref $env:EVENT_REF `
+            -HeadRef $env:EVENT_HEAD_REF `
+            -BaseRef $env:EVENT_BASE_REF `
+            -TestMode $env:TEST_MODE `
+            -Architecture $env:ARCHITECTURE
+          if (-not $decision.valid) {
+            Write-Output "DISPATCH_INPUT_STATUS=FAIL error_category=$($decision.errorCategory)"
+            exit 1
+          }
+          $selectedJobs = @($decision.jobs)
+          $outputs = @{
+            build_job = if ($selectedJobs -contains 'build') { 'true' } else { 'false' }
+            route_job = if ($selectedJobs -contains 'mcp-route-tests') { 'true' } else { 'false' }
+            b1_runtime_job = if ($selectedJobs -contains 'mcp-exe-process-tests') { 'true' } else { 'false' }
+            b1_compile_job = if ($selectedJobs -contains 'mcp-exe-compile-only') { 'true' } else { 'false' }
+          }
+          foreach ($name in $outputs.Keys) { Add-Content -LiteralPath $env:GITHUB_OUTPUT "$name=$($outputs[$name])" }
+          $jobSummary = if ($selectedJobs.Count -eq 0) { 'none' } else { $selectedJobs -join ',' }
+          Write-Output "DISPATCH_INPUT_STATUS=PASS selected_jobs=$jobSummary"
+
   build:
-    if: github.ref != 'refs/heads/ci/mcp-cache-hints-route-tests-20261104' && github.ref != 'refs/heads/ci/mcp-cache-hints-exe-process-20261105'
+    needs: dispatch-input-validation
+    if: needs.dispatch-input-validation.result == 'success' && needs.dispatch-input-validation.outputs.build_job == 'true'
     name: build (${{ matrix.architecture }})
     runs-on: ${{ matrix.architecture == 'arm64' && 'windows-11-arm' || 'windows-latest' }}
     env:
@@ -323,7 +378,8 @@ jobs:
 
   # Temporary regression job, gated to this branch and manual x64 dispatch only.
   mcp-route-tests:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/ci/mcp-cache-hints-route-tests-20261104' && inputs.architecture == 'x64'
+    needs: dispatch-input-validation
+    if: needs.dispatch-input-validation.result == 'success' && needs.dispatch-input-validation.outputs.route_job == 'true'
     name: MCP route regression (x64)
     runs-on: windows-latest
     timeout-minutes: 90
@@ -543,7 +599,8 @@ jobs:
 
   # Gate B1 only: hosted checks cover L1/L2; block Service launch unless L4 is proven.
   mcp-exe-process-tests:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/ci/mcp-cache-hints-exe-process-20261105' && inputs.architecture == 'x64'
+    needs: dispatch-input-validation
+    if: needs.dispatch-input-validation.result == 'success' && needs.dispatch-input-validation.outputs.b1_runtime_job == 'true'
     name: MCP executable process regression (x64)
     runs-on: windows-latest
     timeout-minutes: 90
@@ -691,3 +748,152 @@ jobs:
         timeout-minutes: 5
         shell: pwsh
         run: '& "$env:GITHUB_WORKSPACE\.github\scripts\guard-mcp-exe-egress.ps1" -Mode Cleanup'
+
+  # Compile-only validation for the Gate B1 VM process test. This never runs
+  # the XCTest runner or the Bridge service and is isolated from all runtime jobs.
+  mcp-exe-compile-only:
+    needs: dispatch-input-validation
+    if: needs.dispatch-input-validation.result == 'success' && needs.dispatch-input-validation.outputs.b1_compile_job == 'true'
+    name: Gate B1 compile only (x64)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      SWIFT_VERSION: 6.3.3
+      TARGET_TRIPLE: x86_64-unknown-windows-msvc
+      TARGET_ARCHITECTURE: ${{ inputs.architecture }}
+      TEST_MODE: ${{ inputs.test_mode }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify compile-only dispatch boundary
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_EVENT_NAME -ne "workflow_dispatch" -or
+              $env:GITHUB_REF -ne "refs/heads/ci/mcp-cache-hints-exe-process-20261105" -or
+              $env:TARGET_ARCHITECTURE -ne "x64" -or
+              $env:TEST_MODE -ne "b1-compile-only") {
+            throw "compile_only_dispatch_boundary_mismatch"
+          }
+          if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -ne "X64" -or
+              -not [Environment]::Is64BitProcess) {
+            throw "compile_only_runner_not_windows_x64"
+          }
+          $head = (& git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -cne $env:GITHUB_SHA) {
+            throw "compile_only_checkout_sha_mismatch"
+          }
+          Write-Output "PASS test=compile-only-dispatch architecture=x64 commit=$head"
+      - name: Install Swift toolchain
+        shell: pwsh
+        run: '& "$env:GITHUB_WORKSPACE\.github\scripts\setup-windows-swift.ps1" -Version $env:SWIFT_VERSION'
+      - name: Record Swift toolchain input identity
+        shell: pwsh
+        run: |
+          $versionLine = @(& swift --version 2>&1 | Select-Object -First 1)
+          if ($LASTEXITCODE -ne 0 -or $versionLine.Count -ne 1 -or $versionLine[0] -notmatch 'Swift version 6\.3\.3\b') {
+            throw "swift_toolchain_version_unverified"
+          }
+          $installerPath = Join-Path $env:RUNNER_TEMP "swift-downloads\swift-6.3.3-windows10.exe"
+          if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) { throw "swift_installer_record_missing" }
+          $installerHash = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Output "PASS test=swift-toolchain version=6.3.3 installer_sha256=$installerHash"
+      - name: Prepare Windows Swift test libraries
+        shell: pwsh
+        run: |
+          $triplet = "x64-windows"
+          $vcpkgRoot = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\$triplet"
+          $vcpkgOutput = @(& "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install "sqlite3:$triplet" 2>&1)
+          $vcpkgExitCode = $LASTEXITCODE
+          if ($vcpkgExitCode -ne 0) {
+            $vcpkgOutput | ForEach-Object { Write-Output ([string]$_) }
+            Write-Output "ERROR_CATEGORY=vcpkg_sqlite_setup"
+            exit $vcpkgExitCode
+          }
+          . "$env:GITHUB_WORKSPACE\Scripts\windows-build-environment.ps1"
+          $buildEnvironment = Get-WindowsBuildEnvironment -Architecture "x64"
+          $msvcVersion = Split-Path -Leaf (Split-Path -Parent $buildEnvironment.IncludePaths[0])
+          $windowsSdkVersion = Split-Path -Leaf (Split-Path -Parent $buildEnvironment.IncludePaths[2])
+          $includePaths = @((Join-Path $vcpkgRoot "include")) + $buildEnvironment.IncludePaths
+          $libraryPaths = @((Join-Path $vcpkgRoot "lib")) + $buildEnvironment.LibraryPaths
+          Add-Content $env:GITHUB_ENV "INCLUDE=$($includePaths -join ';')"
+          Add-Content $env:GITHUB_ENV "TARGET_LIBRARY_PATHS=$($libraryPaths -join ';')"
+          Add-Content $env:GITHUB_ENV "LIB=$($libraryPaths -join ';')"
+          Add-Content $env:GITHUB_PATH (Join-Path $vcpkgRoot "bin")
+          $sqlitePackage = @(& "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" list "sqlite3:$triplet" 2>$null)
+          if ($LASTEXITCODE -ne 0 -or $sqlitePackage.Count -ne 1 -or $sqlitePackage[0] -notmatch '^sqlite3:x64-windows\s+') {
+            throw "vcpkg_sqlite_identity_unverified"
+          }
+          $vcpkgRevision = (& git -C $env:VCPKG_INSTALLATION_ROOT rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $vcpkgRevision -notmatch '^[0-9a-f]{40}$') {
+            throw "vcpkg_revision_unavailable"
+          }
+          Write-Output "PASS test=windows-swift-test-libraries architecture=x64 image=$env:ImageVersion msvc=$msvcVersion windows_sdk=$windowsSdkVersion vcpkg_revision=$vcpkgRevision sqlite_package=$($sqlitePackage[0] -replace '\s+', ' ')"
+      - name: Resolve pinned SwiftPM dependencies
+        shell: pwsh
+        run: |
+          $lockFiles = @("Packages/BridgeCore/Package.resolved", "Vendor/swift-sdk/Package.resolved")
+          $before = @{}
+          foreach ($path in $lockFiles) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "swiftpm_lock_missing" }
+            $before[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+          }
+          $resolveOutput = @(& swift package --package-path Packages/BridgeCore resolve --force-resolved-versions 2>&1)
+          $resolveExitCode = $LASTEXITCODE
+          if ($resolveExitCode -ne 0) {
+            $resolveOutput | ForEach-Object { Write-Output ([string]$_) }
+            Write-Output "ERROR_CATEGORY=swift_dependency_resolution"
+            exit $resolveExitCode
+          }
+          foreach ($path in $lockFiles) {
+            $after = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+            if ($after -cne $before[$path]) { throw "swiftpm_lockfile_changed" }
+            Write-Output "PASS test=swiftpm-lock path=$path sha256=$($after.ToLowerInvariant())"
+          }
+      - name: Compile Swift sources and XCTest targets without running them
+        id: compile
+        working-directory: Packages/BridgeCore
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . "$env:GITHUB_WORKSPACE\Scripts\windows-swift-arguments.ps1"
+          $baseArguments = @(Get-WindowsSwiftArguments `
+            -VcpkgInstalledRoot "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows" `
+            -TargetTriple $env:TARGET_TRIPLE `
+            -LibraryPaths ($env:TARGET_LIBRARY_PATHS -split ";"))
+          $buildArguments = @($baseArguments) + @("-c", "debug", "--build-tests")
+          & swift --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT 'compile_attempted=true'
+          & swift build @buildArguments
+          $buildExitCode = $LASTEXITCODE
+          $compileStatus = if ($buildExitCode -eq 0) { 'PASS' } else { 'FAIL' }
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT "compile_status=$compileStatus"
+          if ($buildExitCode -ne 0) {
+            exit $buildExitCode
+          }
+      - name: Report compile-only status without running tests
+        if: always()
+        shell: pwsh
+        env:
+          COMPILE_ATTEMPTED: ${{ steps.compile.outputs.compile_attempted }}
+          COMPILE_STATUS: ${{ steps.compile.outputs.compile_status }}
+        run: |
+          $attempted = $env:COMPILE_ATTEMPTED -ceq 'true'
+          if ($attempted -and $env:COMPILE_STATUS -ceq 'PASS') {
+            Write-Output 'COMPILE_PASS'
+            Write-Output 'B1_COMPILE_STATUS=PASS'
+          } elseif ($attempted) {
+            Write-Output 'COMPILE_FAIL'
+            Write-Output 'B1_COMPILE_STATUS=FAIL'
+          } else {
+            Write-Output 'B1_COMPILE_STATUS=FAIL'
+            Write-Output 'B1_COMPILE_PHASE=NOT_REACHED'
+          }
+          Write-Output 'B1_XCTEST_STATUS=NOT_RUN'
+          Write-Output 'B1_EXE_STATUS=NOT_RUN'
+          Write-Output 'B1_SCHEMA_STATUS=NOT_TESTED'
+          Write-Output 'B1_VM_STATUS=NOT_TESTED'
+          Write-Output 'B1_GATE_STATUS=NOT_PASSED'

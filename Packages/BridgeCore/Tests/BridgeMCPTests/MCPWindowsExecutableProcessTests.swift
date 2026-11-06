@@ -98,10 +98,18 @@ import XCTest
             // Existence only: never enumerate or read an existing user configuration directory.
             throw MCPProcessHarnessError.legacyConfigurationPresent
           }
-          let dataRootURL = runnerTempURL.appendingPathComponent(
-            "codex-bridge-b1-data-\(UUID().uuidString)", isDirectory: true)
-          let profileRootURL = runnerTempURL.appendingPathComponent(
-            "codex-bridge-b1-profile-\(UUID().uuidString)", isDirectory: true)
+          let dataRootURL = URL(
+            fileURLWithPath: environment["CODEX_BRIDGE_VM_DATA_ROOT"]
+              ?? runnerTempURL.appendingPathComponent(
+                "codex-bridge-b1-data-\(UUID().uuidString)", isDirectory: true).path,
+            isDirectory: true
+          ).standardizedFileURL
+          let profileRootURL = URL(
+            fileURLWithPath: environment["CODEX_BRIDGE_VM_PROFILE_ROOT"]
+              ?? runnerTempURL.appendingPathComponent(
+                "codex-bridge-b1-profile-\(UUID().uuidString)", isDirectory: true).path,
+            isDirectory: true
+          ).standardizedFileURL
           let appDataRootURL = profileRootURL.appendingPathComponent("AppData", isDirectory: true)
           let appDataURL = appDataRootURL.appendingPathComponent("Roaming", isDirectory: true)
           let localAppDataURL = appDataRootURL.appendingPathComponent("Local", isDirectory: true)
@@ -119,9 +127,16 @@ import XCTest
 
           let pidRecord: [String: Any] = [
             "pid": 0,
+            "launchState": "prepared",
             "dataRoot": dataRootURL.path,
             "profileRoot": profileRootURL.path,
             "image": "verified-portable/codex-bridge-service.exe",
+            "imagePath": serviceURL.path,
+            "imageSha256": expectedServiceSHA256,
+            "sourceRoot": environment["CODEX_BRIDGE_VM_SOURCE_ROOT"]
+              ?? runnerTempURL.appendingPathComponent("codex-bridge-vm-source-hosted-legacy").path,
+            "candidateRoot": environment["CODEX_BRIDGE_VM_CANDIDATE_ROOT"] ?? candidateURL.path,
+            "captureDirectory": captureURL.path,
           ]
           let pidData = try JSONSerialization.data(
             withJSONObject: pidRecord, options: [.sortedKeys])
@@ -151,10 +166,23 @@ import XCTest
           )
           service.standardOutput = FileHandle.nullDevice
           service.standardError = FileHandle.nullDevice
+          var launchIntentRecord = pidRecord
+          launchIntentRecord["launchState"] = "launching"
+          let launchIntentData = try JSONSerialization.data(
+            withJSONObject: launchIntentRecord, options: [.sortedKeys])
+          try launchIntentData.write(to: pidURL, options: .atomic)
+          print("B1_PROCESS_LAUNCH_INTENT image=verified-portable/codex-bridge-service.exe")
           try service.run()
 
           var runningRecord = pidRecord
           runningRecord["pid"] = service.processIdentifier
+          runningRecord["launchState"] = "started"
+          runningRecord["imagePath"] = serviceURL.path
+          runningRecord["imageSha256"] = expectedServiceSHA256
+          let startedAtFormatter = ISO8601DateFormatter()
+          startedAtFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+          runningRecord["startedAtUtc"] = startedAtFormatter.string(from: Date())
+          runningRecord["testRunnerPid"] = Int(GetCurrentProcessId())
           let runningData = try JSONSerialization.data(
             withJSONObject: runningRecord, options: [.sortedKeys])
           try runningData.write(to: pidURL, options: .atomic)

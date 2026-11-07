@@ -15,6 +15,71 @@ function Assert-ThrowsCategory([scriptblock]$Action, [string]$Category, [string]
   Assert-True ($caught.Exception.Message -like "*$Category*") "$Name-category"
 }
 
+$workflowPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..\workflows\windows.yml'))
+$workflowText = [IO.File]::ReadAllText($workflowPath)
+$workflowLines = $workflowText -split "`r?`n"
+$beginMarker = '# BEGIN VCPKG SQLITE IDENTITY NORMALIZER'
+$endMarker = '# END VCPKG SQLITE IDENTITY NORMALIZER'
+$beginIndexes = @(
+  for ($index = 0; $index -lt $workflowLines.Count; $index++) {
+    if ($workflowLines[$index].Trim() -ceq $beginMarker) { $index }
+  }
+)
+$endIndexes = @(
+  for ($index = 0; $index -lt $workflowLines.Count; $index++) {
+    if ($workflowLines[$index].Trim() -ceq $endMarker) { $index }
+  }
+)
+Assert-True ($beginIndexes.Count -eq 1 -and $endIndexes.Count -eq 1 -and $endIndexes[0] -gt $beginIndexes[0]) 'sqlite-normalizer-markers-are-unique-and-ordered'
+
+$normalizerLines = [Collections.Generic.List[string]]::new()
+for ($index = $beginIndexes[0] + 1; $index -lt $endIndexes[0]; $index++) {
+  $line = $workflowLines[$index]
+  if ($line -match '^ {10}(.*)$') {
+    $normalizerLines.Add($Matches[1])
+  } elseif ([string]::IsNullOrWhiteSpace($line)) {
+    $normalizerLines.Add('')
+  } else {
+    throw 'sqlite_normalizer_yaml_indentation_unexpected'
+  }
+}
+. ([scriptblock]::Create($normalizerLines -join "`n"))
+
+$acceptedSqliteCases = @(
+  [pscustomobject]@{ Name = 'version-only'; Lines = [string[]]@('sqlite3:x64-windows 3.54.1'); Expected = 'sqlite3:x64-windows 3.54.1' }
+  [pscustomobject]@{ Name = 'version-with-description'; Lines = [string[]]@('sqlite3:x64-windows 3.54.1 SQLite is a software library ...'); Expected = 'sqlite3:x64-windows 3.54.1' }
+  [pscustomobject]@{ Name = 'version-revision-with-description'; Lines = [string[]]@('sqlite3:x64-windows 3.50.4#1 SQLite description'); Expected = 'sqlite3:x64-windows 3.50.4#1' }
+)
+foreach ($case in $acceptedSqliteCases) {
+  $normalized = ConvertTo-VcpkgSqliteIdentity -ListOutput $case.Lines
+  Assert-True ($normalized -ceq $case.Expected) "sqlite-$($case.Name)-normalizes-exactly"
+  $environmentRecord = "VCPKG_SQLITE_PACKAGE=$normalized"
+  Assert-True ($environmentRecord -ceq "VCPKG_SQLITE_PACKAGE=$($case.Expected)") "sqlite-$($case.Name)-environment-value-is-normalized"
+}
+
+$rejectedSqliteCases = @(
+  [pscustomobject]@{ Name = 'wrong-triplet'; Lines = [string[]]@('sqlite3:arm64-windows 3.54.1') }
+  [pscustomobject]@{ Name = 'missing-version'; Lines = [string[]]@('sqlite3:x64-windows') }
+  [pscustomobject]@{ Name = 'unrecognized-package'; Lines = [string[]]@('unrecognized-package 3.54.1') }
+  [pscustomobject]@{ Name = 'unknown-version'; Lines = [string[]]@('sqlite3:x64-windows latest') }
+  [pscustomobject]@{ Name = 'newline-injection'; Lines = [string[]]@("sqlite3:x64-windows 3.54.1`r`nVCPKG_SQLITE_PACKAGE=untrusted") }
+  [pscustomobject]@{ Name = 'multiple-output-lines'; Lines = [string[]]@('sqlite3:x64-windows 3.54.1', 'sqlite3:x64-windows 3.54.1') }
+)
+foreach ($case in $rejectedSqliteCases) {
+  Assert-ThrowsCategory {
+    ConvertTo-VcpkgSqliteIdentity -ListOutput $case.Lines
+  } 'vcpkg_sqlite_identity_unverified' "sqlite-$($case.Name)-is-rejected"
+}
+
+$sqliteAssignmentMatches = [regex]::Matches($workflowText, '(?m)^\s*Add-Content \$env:GITHUB_ENV "VCPKG_SQLITE_PACKAGE=([^"]+)"')
+Assert-True ($sqliteAssignmentMatches.Count -eq 1) 'sqlite-environment-is-written-once'
+Assert-True ($sqliteAssignmentMatches[0].Groups[1].Value -ceq '$normalizedSqlitePackage') 'sqlite-environment-uses-normalized-value'
+$inventoryModeIndex = $workflowText.LastIndexOf('if ($env:TEST_MODE -ceq "b1-package-inventory-only") {', $sqliteAssignmentMatches[0].Index, [StringComparison]::Ordinal)
+$normalizerBeginOffset = $workflowText.IndexOf($beginMarker, [StringComparison]::Ordinal)
+Assert-True ($inventoryModeIndex -ge 0 -and $inventoryModeIndex -lt $normalizerBeginOffset -and $normalizerBeginOffset -lt $sqliteAssignmentMatches[0].Index) 'sqlite-normalizer-is-scoped-to-inventory-mode'
+Assert-True ($workflowText.Contains('if ($LASTEXITCODE -ne 0 -or $sqlitePackage.Count -ne 1 -or $sqlitePackage[0] -notmatch ''^sqlite3:x64-windows\s+'')')) 'existing-vcpkg-list-success-check-is-preserved'
+Write-Output 'PASS test=vcpkg-sqlite-identity-synthetic accepted=3 rejected=6 failures=0'
+
 function Write-SyntheticPE([string]$Path, [UInt16]$Machine) {
   $bytes = [byte[]]::new(128)
   $bytes[0] = 0x4d

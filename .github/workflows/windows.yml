@@ -16,12 +16,12 @@ on:
         description: Test-only mode for isolated validation branches
         required: true
         type: choice
-        options: [standard, b1-compile-only]
+        options: [standard, b1-compile-only, b1-package-inventory-only]
 permissions:
   contents: read
 
 concurrency:
-  group: windows-${{ github.ref }}-${{ inputs.architecture || 'all' }}${{ inputs.test_mode == 'b1-compile-only' && '-compile-only' || '' }}
+  group: windows-${{ github.ref }}-${{ inputs.architecture || 'all' }}${{ inputs.test_mode == 'b1-compile-only' && '-compile-only' || '' }}${{ inputs.test_mode == 'b1-package-inventory-only' && '-package-inventory' || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -749,12 +749,12 @@ jobs:
         shell: pwsh
         run: '& "$env:GITHUB_WORKSPACE\.github\scripts\guard-mcp-exe-egress.ps1" -Mode Cleanup'
 
-  # Compile-only validation for the Gate B1 VM process test. This never runs
-  # the XCTest runner or the Bridge service and is isolated from all runtime jobs.
+  # Compile-only and package-inventory validation for the Gate B1 VM process test.
+  # The optional inventory path never runs the XCTest runner or Bridge service.
   mcp-exe-compile-only:
     needs: dispatch-input-validation
     if: needs.dispatch-input-validation.result == 'success' && needs.dispatch-input-validation.outputs.b1_compile_job == 'true'
-    name: Gate B1 compile only (x64)
+    name: ${{ inputs.test_mode == 'b1-package-inventory-only' && 'Gate B1 package inventory (x64)' || 'Gate B1 compile only (x64)' }}
     runs-on: windows-latest
     timeout-minutes: 90
     permissions:
@@ -774,8 +774,8 @@ jobs:
           if ($env:GITHUB_EVENT_NAME -ne "workflow_dispatch" -or
               $env:GITHUB_REF -ne "refs/heads/ci/mcp-cache-hints-exe-process-20261105" -or
               $env:TARGET_ARCHITECTURE -ne "x64" -or
-              $env:TEST_MODE -ne "b1-compile-only") {
-            throw "compile_only_dispatch_boundary_mismatch"
+              $env:TEST_MODE -cnotin @("b1-compile-only", "b1-package-inventory-only")) {
+            throw "compile_or_inventory_dispatch_boundary_mismatch"
           }
           if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -ne "X64" -or
               -not [Environment]::Is64BitProcess) {
@@ -890,6 +890,9 @@ jobs:
           Write-Output "PASS test=swift-toolchain version=6.3.3 installer_sha256=$installerHash"
           Add-Content $env:GITHUB_ENV "SWIFT_TOOLCHAIN_VERIFIED_VERSION=$env:SWIFT_VERSION"
           Add-Content $env:GITHUB_ENV "SWIFT_TOOLCHAIN_VERIFIED_PATH_ID=$pathId"
+          if ($env:TEST_MODE -ceq "b1-package-inventory-only") {
+            Add-Content $env:GITHUB_ENV "SWIFT_INSTALLER_SHA256=$installerHash"
+          }
       - name: Prepare Windows Swift test libraries
         shell: pwsh
         run: |
@@ -921,6 +924,17 @@ jobs:
             throw "vcpkg_revision_unavailable"
           }
           Write-Output "PASS test=windows-swift-test-libraries architecture=x64 image=$env:ImageVersion msvc=$msvcVersion windows_sdk=$windowsSdkVersion vcpkg_revision=$vcpkgRevision sqlite_package=$($sqlitePackage[0] -replace '\s+', ' ')"
+          if ($env:TEST_MODE -ceq "b1-package-inventory-only") {
+            $msvcRoot = Split-Path -Parent $buildEnvironment.IncludePaths[0]
+            $dumpbinPath = Join-Path $msvcRoot "bin\Hostx64\x64\dumpbin.exe"
+            if (-not (Test-Path -LiteralPath $dumpbinPath -PathType Leaf)) { throw "msvc_dumpbin_unavailable" }
+            Add-Content $env:GITHUB_ENV "VCPKG_REVISION=$vcpkgRevision"
+            Add-Content $env:GITHUB_ENV "VCPKG_SQLITE_PACKAGE=$($sqlitePackage[0] -replace '\s+', ' ')"
+            Add-Content $env:GITHUB_ENV "WINDOWS_MSVC_VERSION=$msvcVersion"
+            Add-Content $env:GITHUB_ENV "WINDOWS_SDK_VERSION=$windowsSdkVersion"
+            Add-Content $env:GITHUB_ENV "WINDOWS_RUNNER_IMAGE=$env:ImageVersion"
+            Add-Content $env:GITHUB_ENV "MSVC_DUMPBIN_PATH=$dumpbinPath"
+          }
       - name: Resolve pinned SwiftPM dependencies
         shell: pwsh
         run: |
@@ -957,6 +971,10 @@ jobs:
             if ($after -cne $before[$path]) { throw "swiftpm_lockfile_changed" }
             Write-Output "PASS test=swiftpm-lock path=$path sha256=$($after.ToLowerInvariant())"
           }
+          if ($env:TEST_MODE -ceq "b1-package-inventory-only") {
+            Add-Content $env:GITHUB_ENV "SWIFTPM_CORE_LOCK_SHA256=$($before['Packages/BridgeCore/Package.resolved'].ToLowerInvariant())"
+            Add-Content $env:GITHUB_ENV "SWIFTPM_SDK_LOCK_SHA256=$($before['Vendor/swift-sdk/Package.resolved'].ToLowerInvariant())"
+          }
       - name: Compile Swift sources and XCTest targets without running them
         id: compile
         working-directory: Packages/BridgeCore
@@ -983,6 +1001,16 @@ jobs:
             -TargetTriple $env:TARGET_TRIPLE `
             -LibraryPaths ($env:TARGET_LIBRARY_PATHS -split ";"))
           $buildArguments = @($baseArguments) + @("-c", "debug", "--build-tests")
+          if ($env:TEST_MODE -ceq "b1-package-inventory-only") {
+            $buildArgumentsBytes = [Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject ([object[]](@("build") + $buildArguments)) -Compress -Depth 3))
+            $argumentSha = [Security.Cryptography.SHA256]::Create()
+            try {
+              $buildArgumentsSha256 = [BitConverter]::ToString($argumentSha.ComputeHash($buildArgumentsBytes)).Replace('-', '').ToLowerInvariant()
+            } finally {
+              $argumentSha.Dispose()
+            }
+            Add-Content -LiteralPath $env:GITHUB_ENV "SWIFT_BUILD_ARGUMENTS_SHA256=$buildArgumentsSha256"
+          }
           Add-Content -LiteralPath $env:GITHUB_OUTPUT 'compile_attempted=true'
           & $swiftExe build @buildArguments
           $buildExitCode = $LASTEXITCODE
@@ -991,8 +1019,67 @@ jobs:
           if ($buildExitCode -ne 0) {
             exit $buildExitCode
           }
+      - name: Inventory SwiftPM test build outputs without executing them
+        id: inventory
+        if: inputs.test_mode == 'b1-package-inventory-only'
+        shell: pwsh
+        working-directory: Packages/BridgeCore
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+        run: '& "$env:GITHUB_WORKSPACE\.github\scripts\vm\Invoke-McpSwiftBuildInventory.ps1"'
+      - name: Upload inventory manifest only
+        id: upload_inventory
+        if: >-
+          inputs.test_mode == 'b1-package-inventory-only' &&
+          steps.inventory.outputs.inventory_created == 'true' &&
+          steps.inventory.outputs.manifest_complete == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: b1-package-inventory-${{ github.run_id }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/b1-package-inventory/inventory.json
+            ${{ runner.temp }}/b1-package-inventory/mcp-2026-07-28.json
+            ${{ runner.temp }}/b1-package-inventory/SHA256SUMS.txt
+            ${{ runner.temp }}/b1-package-inventory/SHA256SUMS.txt.sha256
+          if-no-files-found: error
+          retention-days: 1
+      - name: Report package inventory-only status
+        if: always() && inputs.test_mode == 'b1-package-inventory-only'
+        shell: pwsh
+        env:
+          COMPILE_OUTCOME: ${{ steps.compile.outcome }}
+          COMPILE_STATUS: ${{ steps.compile.outputs.compile_status }}
+          INVENTORY_OUTCOME: ${{ steps.inventory.outcome }}
+          INVENTORY_CREATED: ${{ steps.inventory.outputs.inventory_created }}
+          MANIFEST_COMPLETE: ${{ steps.inventory.outputs.manifest_complete }}
+          UPLOAD_OUTCOME: ${{ steps.upload_inventory.outcome }}
+        run: |
+          $compilePass = $env:COMPILE_OUTCOME -ceq 'success' -and $env:COMPILE_STATUS -ceq 'PASS'
+          $inventoryPass = $env:INVENTORY_OUTCOME -ceq 'success' -and $env:INVENTORY_CREATED -ceq 'true'
+          $manifestPass = $inventoryPass -and $env:MANIFEST_COMPLETE -ceq 'true'
+          $uploadPass = $env:UPLOAD_OUTCOME -ceq 'success'
+          Write-Output "COMPILE_PREREQUISITE_STATUS=$(if ($compilePass) { 'PASS' } else { 'FAIL' })"
+          Write-Output "INVENTORY_STATUS=$(if ($inventoryPass) { 'PASS' } elseif ($compilePass) { 'FAIL' } else { 'NOT_RUN' })"
+          Write-Output "MANIFEST_STATUS=$(if ($manifestPass) { 'PASS' } elseif ($inventoryPass) { 'FAIL' } else { 'NOT_CREATED' })"
+          Write-Output "ARTIFACT_UPLOAD_STATUS=$(if ($uploadPass) { 'PASS' } elseif ($manifestPass) { 'FAIL' } else { 'NOT_RUN' })"
+          if (-not $compilePass) {
+            Write-Output 'INVENTORY_FAIL reason=compile_prerequisite_failed'
+          } elseif (-not $inventoryPass) {
+            Write-Output 'INVENTORY_FAIL reason=inventory_failed'
+          } elseif (-not $manifestPass) {
+            Write-Output 'INVENTORY_FAIL reason=manifest_incomplete'
+          } elseif (-not $uploadPass) {
+            Write-Output 'INVENTORY_FAIL reason=artifact_upload_failed'
+          } else {
+            Write-Output 'INVENTORY_PASS'
+          }
+          Write-Output 'TEST_PACKAGE_STATUS=NOT_CREATED'
+          Write-Output 'EXECUTABLE_CLASSIFICATION=UNRESOLVED'
+          Write-Output 'GATE_B1=NOT_PASSED'
+          if (-not ($compilePass -and $inventoryPass -and $manifestPass -and $uploadPass)) { exit 1 }
       - name: Report compile-only status without running tests
-        if: always()
+        if: always() && inputs.test_mode == 'b1-compile-only'
         shell: pwsh
         env:
           COMPILE_ATTEMPTED: ${{ steps.compile.outputs.compile_attempted }}

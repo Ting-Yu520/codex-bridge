@@ -26,7 +26,7 @@ function Get-CodexBridgeWorkflowDecision {
     if ([string]::IsNullOrWhiteSpace($TestMode)) {
       return New-CodexBridgeWorkflowDecision $false 'dispatch_test_mode_missing' @()
     }
-    if ($TestMode -cnotin @('standard', 'b1-compile-only')) {
+    if ($TestMode -cnotin @('standard', 'b1-compile-only', 'b1-package-inventory-only')) {
       return New-CodexBridgeWorkflowDecision $false 'dispatch_test_mode_invalid' @()
     }
     if ([string]::IsNullOrWhiteSpace($Architecture)) {
@@ -53,7 +53,10 @@ function Get-CodexBridgeWorkflowDecision {
       if ($TestMode -ceq 'standard') {
         return New-CodexBridgeWorkflowDecision $true '' @('mcp-exe-process-tests')
       }
-      return New-CodexBridgeWorkflowDecision $true '' @('mcp-exe-compile-only')
+    if ($TestMode -ceq 'b1-compile-only' -or $TestMode -ceq 'b1-package-inventory-only') {
+        return New-CodexBridgeWorkflowDecision $true '' @('mcp-exe-compile-only')
+      }
+      return New-CodexBridgeWorkflowDecision $false 'dispatch_gate_b1_mode_invalid' @()
     }
     if ($branch -ceq 'win' -or $branch -cmatch '^codex/platform-[^/]+$') {
       if ($TestMode -cne 'standard') {

@@ -147,6 +147,108 @@ function Assert-PortableManifest([string]$PayloadRoot) {
   return $manifest.Count
 }
 
+$script:ArtifactPreparationStages = @(
+  "PRECONDITION",
+  "RUN_METADATA",
+  "ARTIFACT_LIST",
+  "ARTIFACT_DOWNLOAD",
+  "OUTER_DIGEST",
+  "OUTER_EXTRACTION",
+  "PORTABLE_ZIP_IDENTITY",
+  "PORTABLE_EXTRACTION",
+  "PORTABLE_MANIFEST",
+  "BUILD_INFO",
+  "SERVICE_IDENTITY",
+  "FINAL_VALIDATION"
+)
+
+function Get-SafeArtifactPreparationFailureKind(
+  [string]$Stage,
+  [System.Management.Automation.ErrorRecord]$ErrorRecord
+) {
+  $message = [string]$ErrorRecord.Exception.Message
+  $knownKinds = @{
+    "runner_or_read_token_missing" = "REQUIRED_RUNNER_INPUT_MISSING"
+    "runner_not_x64" = "RUNNER_ARCHITECTURE_UNSUPPORTED"
+    "runner_temp_collision" = "RUNNER_TEMP_COLLISION"
+    "source_run_identity_mismatch" = "SOURCE_RUN_IDENTITY_MISMATCH"
+    "source_artifact_missing_or_ambiguous" = "SOURCE_ARTIFACT_SELECTION_FAILED"
+    "source_artifact_metadata_digest_mismatch" = "ARTIFACT_METADATA_DIGEST_MISMATCH"
+    "artifact_download_non_https" = "DOWNLOAD_SCHEME_REJECTED"
+    "artifact_redirect_location_missing" = "REDIRECT_LOCATION_MISSING"
+    "artifact_redirect_host_not_allowed" = "REDIRECT_HOST_REJECTED"
+    "artifact_download_http_failure" = "DOWNLOAD_HTTP_FAILURE"
+    "artifact_redirect_limit" = "REDIRECT_LIMIT_EXCEEDED"
+    "outer_artifact_digest_mismatch" = "OUTER_ARTIFACT_DIGEST_MISMATCH"
+    "unsafe_archive_path" = "UNSAFE_ARCHIVE_PATH_REJECTED"
+    "unsafe_archive_entry" = "UNSAFE_ARCHIVE_ENTRY_REJECTED"
+    "archive_symlink_not_allowed" = "ARCHIVE_SYMLINK_REJECTED"
+    "duplicate_archive_entry" = "DUPLICATE_ARCHIVE_ENTRY_REJECTED"
+    "archive_expansion_limit" = "ARCHIVE_EXPANSION_LIMIT"
+    "archive_reparse_point_not_allowed" = "ARCHIVE_REPARSE_POINT_REJECTED"
+    "portable_zip_missing_or_ambiguous" = "PORTABLE_ZIP_SELECTION_FAILED"
+    "portable_zip_digest_mismatch" = "PORTABLE_ZIP_DIGEST_MISMATCH"
+    "manifest_reparse_point" = "MANIFEST_REPARSE_POINT_REJECTED"
+    "manifest_format_invalid" = "MANIFEST_FORMAT_INVALID"
+    "manifest_path_invalid" = "MANIFEST_PATH_INVALID"
+    "manifest_duplicate_path" = "MANIFEST_DUPLICATE_PATH"
+    "manifest_file_set_mismatch" = "MANIFEST_FILE_SET_MISMATCH"
+    "payload_reparse_point" = "PAYLOAD_REPARSE_POINT_REJECTED"
+    "manifest_file_missing" = "MANIFEST_FILE_MISSING"
+    "manifest_hash_mismatch" = "MANIFEST_HASH_MISMATCH"
+    "build_info_identity_mismatch" = "BUILD_INFO_IDENTITY_MISMATCH"
+    "service_exe_digest_mismatch" = "SERVICE_EXE_DIGEST_MISMATCH"
+    "service_exe_architecture_mismatch" = "SERVICE_EXE_ARCHITECTURE_MISMATCH"
+    "portable_runtime_files_missing" = "PORTABLE_RUNTIME_FILES_MISSING"
+    "portable_pe_architecture_mismatch" = "PORTABLE_PE_ARCHITECTURE_MISMATCH"
+  }
+
+  if ($knownKinds.ContainsKey($message)) { return $knownKinds[$message] }
+  $exceptionType = $ErrorRecord.Exception.GetType().FullName
+  if ($Stage -in @("RUN_METADATA", "ARTIFACT_LIST") -and
+      $exceptionType -in @(
+        "Microsoft.PowerShell.Commands.HttpResponseException",
+        "System.Net.Http.HttpRequestException",
+        "System.Net.WebException"
+      )) {
+    return "GITHUB_API_REQUEST_FAILED"
+  }
+  if ($Stage -eq "ARTIFACT_DOWNLOAD" -and
+      $exceptionType -in @("System.Net.Http.HttpRequestException", "System.Net.WebException")) {
+    return "ARTIFACT_DOWNLOAD_FAILED"
+  }
+  return "UNKNOWN"
+}
+
+function Write-ArtifactPreparationFailure(
+  [string]$Stage,
+  [System.Management.Automation.ErrorRecord]$ErrorRecord
+) {
+  $safeStage = if ($script:ArtifactPreparationStages -contains $Stage) { $Stage } else { "UNKNOWN" }
+  $safeKind = Get-SafeArtifactPreparationFailureKind -Stage $safeStage -ErrorRecord $ErrorRecord
+  Write-Output "ERROR_CATEGORY=candidate_artifact_preparation_failed"
+  Write-Output "ARTIFACT_PREP_FAILED_STAGE=$safeStage"
+  Write-Output "ARTIFACT_PREP_FAILURE_KIND=$safeKind"
+  $script:ArtifactPreparationExitCode = 1
+}
+
+function Write-PreparedArtifactEnvironment(
+  [string]$GitHubEnvPath,
+  [string]$CandidateDirectory,
+  [string]$CandidateSha256,
+  [string]$CaptureDirectory,
+  [string]$PidRecord
+) {
+  Add-Content -LiteralPath $GitHubEnvPath -Value "CODEX_BRIDGE_CANDIDATE_DIR=$CandidateDirectory"
+  Add-Content -LiteralPath $GitHubEnvPath -Value "CODEX_BRIDGE_CANDIDATE_SHA256=$CandidateSha256"
+  Add-Content -LiteralPath $GitHubEnvPath -Value "CODEX_BRIDGE_MCP_PROCESS_CAPTURE_DIR=$CaptureDirectory"
+  Add-Content -LiteralPath $GitHubEnvPath -Value "CODEX_BRIDGE_MCP_PROCESS_PID_FILE=$PidRecord"
+  Add-Content -LiteralPath $GitHubEnvPath -Value "CODEX_BRIDGE_ARTIFACT_VERIFICATION=PASS"
+}
+
+if ($MyInvocation.InvocationName -eq ".") { return }
+
+$currentStage = "PRECONDITION"
 try {
   if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP) -or [string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) {
     throw "runner_or_read_token_missing"
@@ -167,10 +269,13 @@ try {
     Accept = "application/vnd.github+json"
     "X-GitHub-Api-Version" = "2022-11-28"
   }
+  $currentStage = "RUN_METADATA"
   $run = Invoke-RestMethod -Method Get -Uri "$apiRoot/actions/runs/$expectedRunId" -Headers $headers -MaximumRedirection 0
   if (([long]$run.id) -ne $expectedRunId -or $run.head_sha -ne $expectedCommit -or $run.head_branch -ne "ci/mcp-cache-hints") {
     throw "source_run_identity_mismatch"
   }
+
+  $currentStage = "ARTIFACT_LIST"
   $artifactList = Invoke-RestMethod -Method Get -Uri "$apiRoot/actions/runs/$expectedRunId/artifacts?per_page=100" -Headers $headers -MaximumRedirection 0
   $matches = @($artifactList.artifacts | Where-Object { $_.name -eq $artifactName -and -not $_.expired })
   if ($matches.Count -ne 1) { throw "source_artifact_missing_or_ambiguous" }
@@ -179,20 +284,31 @@ try {
   if ($apiDigest -ne $expectedArtifactDigest) { throw "source_artifact_metadata_digest_mismatch" }
 
   $downloadUrl = "$apiRoot/actions/artifacts/$($artifact.id)/zip"
+  $currentStage = "ARTIFACT_DOWNLOAD"
   Download-ArtifactZip -Uri $downloadUrl -Destination $outerZip
+
+  $currentStage = "OUTER_DIGEST"
   $outerDigest = Get-Sha256 $outerZip
   if ($outerDigest -ne $expectedArtifactDigest) { throw "outer_artifact_digest_mismatch" }
 
+  $currentStage = "OUTER_EXTRACTION"
   Expand-SafeZip -ArchivePath $outerZip -Destination $outerExtract
   $outerFiles = @(Get-ChildItem -LiteralPath $outerExtract -File -Recurse)
+
+  $currentStage = "PORTABLE_ZIP_IDENTITY"
   $portableZipCandidates = @($outerFiles | Where-Object { $_.Name -eq "codex-bridge-windows-x64.zip" })
   if ($outerFiles.Count -ne 1 -or $portableZipCandidates.Count -ne 1) { throw "portable_zip_missing_or_ambiguous" }
   $portableZip = $portableZipCandidates[0].FullName
   $portableDigest = Get-Sha256 $portableZip
   if ($portableDigest -ne $expectedPortableZipDigest) { throw "portable_zip_digest_mismatch" }
 
+  $currentStage = "PORTABLE_EXTRACTION"
   Expand-SafeZip -ArchivePath $portableZip -Destination $payloadRoot
+
+  $currentStage = "PORTABLE_MANIFEST"
   $manifestFileCount = Assert-PortableManifest -PayloadRoot $payloadRoot
+
+  $currentStage = "BUILD_INFO"
   $buildInfoPath = Join-Path $payloadRoot "BUILD-INFO.json"
   $buildInfo = Get-Content -LiteralPath $buildInfoPath -Raw | ConvertFrom-Json -AsHashtable
   if ($buildInfo.schema -ne "codex-bridge-windows-portable/v1" -or
@@ -203,10 +319,14 @@ try {
       $buildInfo.swiftVersion -notmatch '^Swift version 6\.3\.3') {
     throw "build_info_identity_mismatch"
   }
+
+  $currentStage = "SERVICE_IDENTITY"
   $servicePath = Join-Path $payloadRoot "codex-bridge-service.exe"
   if ((Get-Sha256 $servicePath) -ne $expectedServiceDigest) { throw "service_exe_digest_mismatch" }
   . (Join-Path $env:GITHUB_WORKSPACE "Scripts\windows-portable-support.ps1")
   if ((Get-PEMachine $servicePath) -ne [UInt16]0x8664) { throw "service_exe_architecture_mismatch" }
+
+  $currentStage = "FINAL_VALIDATION"
   $portablePEFiles = @(Get-ChildItem -LiteralPath $payloadRoot -File -Recurse | Where-Object { $_.Extension -in @(".exe", ".dll") })
   if ($portablePEFiles.Count -lt 2) { throw "portable_runtime_files_missing" }
   foreach ($peFile in $portablePEFiles) {
@@ -218,18 +338,21 @@ try {
   if ((Test-Path -LiteralPath $captureDirectory) -or (Test-Path -LiteralPath $pidRecord)) {
     throw "runner_temp_collision"
   }
-  Add-Content -LiteralPath $env:GITHUB_ENV -Value "CODEX_BRIDGE_CANDIDATE_DIR=$payloadRoot"
-  Add-Content -LiteralPath $env:GITHUB_ENV -Value "CODEX_BRIDGE_CANDIDATE_SHA256=$expectedServiceDigest"
-  Add-Content -LiteralPath $env:GITHUB_ENV -Value "CODEX_BRIDGE_ARTIFACT_VERIFICATION=PASS"
-  Add-Content -LiteralPath $env:GITHUB_ENV -Value "CODEX_BRIDGE_MCP_PROCESS_CAPTURE_DIR=$captureDirectory"
-  Add-Content -LiteralPath $env:GITHUB_ENV -Value "CODEX_BRIDGE_MCP_PROCESS_PID_FILE=$pidRecord"
+  $script:ArtifactPreparationExitCode = 0
+  Write-PreparedArtifactEnvironment `
+    -GitHubEnvPath $env:GITHUB_ENV `
+    -CandidateDirectory $payloadRoot `
+    -CandidateSha256 $expectedServiceDigest `
+    -CaptureDirectory $captureDirectory `
+    -PidRecord $pidRecord
   Write-Output "PASS test=source-run run_id=$expectedRunId commit=$expectedCommit"
   Write-Output "PASS test=artifact-outer-zip sha256=$outerDigest"
   Write-Output "PASS test=portable-zip sha256=$portableDigest"
   Write-Output "PASS test=service-exe architecture=x64 sha256=$expectedServiceDigest"
   Write-Output "PASS test=portable-manifest files=$manifestFileCount"
   Write-Output "PASS test=build-info version=$($buildInfo.appVersion) architecture=$($buildInfo.architecture)"
+  return
 } catch {
-  Write-Output "ERROR_CATEGORY=candidate_artifact_preparation_failed"
+  Write-ArtifactPreparationFailure -Stage $currentStage -ErrorRecord $_
   exit 1
 }

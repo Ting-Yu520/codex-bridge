@@ -135,7 +135,7 @@ foreach ($case in $rejectedSqliteCases) {
 $sqliteAssignmentMatches = [regex]::Matches($workflowText, '(?m)^\s*Add-Content \$env:GITHUB_ENV "VCPKG_SQLITE_PACKAGE=([^"]+)"')
 Assert-True ($sqliteAssignmentMatches.Count -eq 1) 'sqlite-environment-is-written-once'
 Assert-True ($sqliteAssignmentMatches[0].Groups[1].Value -ceq '$normalizedSqlitePackage') 'sqlite-environment-uses-normalized-value'
-$inventoryModeIndex = $workflowText.LastIndexOf('if ($env:TEST_MODE -ceq "b1-package-inventory-only") {', $sqliteAssignmentMatches[0].Index, [StringComparison]::Ordinal)
+$inventoryModeIndex = $workflowText.LastIndexOf('if ($env:TEST_MODE -cin @("b1-package-inventory-only", "b1-dependency-audit-only")) {', $sqliteAssignmentMatches[0].Index, [StringComparison]::Ordinal)
 $normalizerBeginOffset = $workflowText.IndexOf($beginMarker, [StringComparison]::Ordinal)
 Assert-True ($inventoryModeIndex -ge 0 -and $inventoryModeIndex -lt $normalizerBeginOffset -and $normalizerBeginOffset -lt $sqliteAssignmentMatches[0].Index) 'sqlite-normalizer-is-scoped-to-inventory-mode'
 Assert-True ($workflowText.Contains('if ($LASTEXITCODE -ne 0 -or $sqlitePackage.Count -ne 1 -or $sqlitePackage[0] -notmatch ''^sqlite3:x64-windows\s+'')')) 'existing-vcpkg-list-success-check-is-preserved'

@@ -33,6 +33,11 @@ $cases = @(
   @{ name = 'dispatch-compile-b1-arm64-invalid'; valid = $false; jobs = ''; parameters = @{ EventName = 'workflow_dispatch'; Ref = 'refs/heads/ci/mcp-cache-hints-exe-process-20261105'; HeadRef = ''; BaseRef = ''; TestMode = 'b1-compile-only'; Architecture = 'arm64' } },
   @{ name = 'dispatch-compile-b1-x64'; valid = $true; jobs = 'mcp-exe-compile-only'; parameters = @{ EventName = 'workflow_dispatch'; Ref = 'refs/heads/ci/mcp-cache-hints-exe-process-20261105'; HeadRef = ''; BaseRef = ''; TestMode = 'b1-compile-only'; Architecture = 'x64' } },
   @{ name = 'dispatch-package-inventory-b1-x64'; valid = $true; jobs = 'mcp-exe-compile-only'; parameters = @{ EventName = 'workflow_dispatch'; Ref = 'refs/heads/ci/mcp-cache-hints-exe-process-20261105'; HeadRef = ''; BaseRef = ''; TestMode = 'b1-package-inventory-only'; Architecture = 'x64' } },
+  @{ name = 'dispatch-dependency-audit-b1-x64'; valid = $true; jobs = 'mcp-exe-compile-only'; parameters = @{ EventName = 'workflow_dispatch'; Ref = 'refs/heads/ci/mcp-cache-hints-exe-process-20261105'; HeadRef = ''; BaseRef = ''; TestMode = 'b1-dependency-audit-only'; Architecture = 'x64'; RequestedSourceCommit = '6c4d86c0cec892f69c27749f81690ed4b70d89d3'; WorkflowSha = '6c4d86c0cec892f69c27749f81690ed4b70d89d3' } },
+  @{ name = 'dispatch-dependency-audit-b1-arm64-invalid'; valid = $false; jobs = ''; parameters = @{ EventName = 'workflow_dispatch'; Ref = 'refs/heads/ci/mcp-cache-hints-exe-process-20261105'; HeadRef = ''; BaseRef = ''; TestMode = 'b1-dependency-audit-only'; Architecture = 'arm64'; RequestedSourceCommit = '6c4d86c0cec892f69c27749f81690ed4b70d89d3'; WorkflowSha = '6c4d86c0cec892f69c27749f81690ed4b70d89d3' } },
+  @{ name = 'dispatch-dependency-audit-wrong-branch-invalid'; valid = $false; jobs = ''; parameters = @{ EventName = 'workflow_dispatch'; Ref = 'refs/heads/win'; HeadRef = ''; BaseRef = ''; TestMode = 'b1-dependency-audit-only'; Architecture = 'x64'; RequestedSourceCommit = '6c4d86c0cec892f69c27749f81690ed4b70d89d3'; WorkflowSha = '6c4d86c0cec892f69c27749f81690ed4b70d89d3' } },
+  @{ name = 'dispatch-dependency-audit-commit-missing-invalid'; valid = $false; jobs = ''; parameters = @{ EventName = 'workflow_dispatch'; Ref = 'refs/heads/ci/mcp-cache-hints-exe-process-20261105'; HeadRef = ''; BaseRef = ''; TestMode = 'b1-dependency-audit-only'; Architecture = 'x64'; RequestedSourceCommit = ''; WorkflowSha = '6c4d86c0cec892f69c27749f81690ed4b70d89d3' } },
+  @{ name = 'dispatch-dependency-audit-commit-mismatch-invalid'; valid = $false; jobs = ''; parameters = @{ EventName = 'workflow_dispatch'; Ref = 'refs/heads/ci/mcp-cache-hints-exe-process-20261105'; HeadRef = ''; BaseRef = ''; TestMode = 'b1-dependency-audit-only'; Architecture = 'x64'; RequestedSourceCommit = '0000000000000000000000000000000000000000'; WorkflowSha = '6c4d86c0cec892f69c27749f81690ed4b70d89d3' } },
   @{ name = 'dispatch-package-inventory-b1-arm64-invalid'; valid = $false; jobs = ''; parameters = @{ EventName = 'workflow_dispatch'; Ref = 'refs/heads/ci/mcp-cache-hints-exe-process-20261105'; HeadRef = ''; BaseRef = ''; TestMode = 'b1-package-inventory-only'; Architecture = 'arm64' } },
   @{ name = 'dispatch-package-inventory-wrong-branch-invalid'; valid = $false; jobs = ''; parameters = @{ EventName = 'workflow_dispatch'; Ref = 'refs/heads/win'; HeadRef = ''; BaseRef = ''; TestMode = 'b1-package-inventory-only'; Architecture = 'x64' } },
   @{ name = 'dispatch-compile-win-invalid'; valid = $false; jobs = ''; parameters = @{ EventName = 'workflow_dispatch'; Ref = 'refs/heads/win'; HeadRef = ''; BaseRef = ''; TestMode = 'b1-compile-only'; Architecture = 'x64' } },
@@ -108,7 +113,8 @@ $dispatchStart = $workflow.IndexOf('  workflow_dispatch:')
 $permissionsStart = $workflow.IndexOf('permissions:', $dispatchStart)
 $dispatchInputText = $workflow.Substring($dispatchStart, $permissionsStart - $dispatchStart)
 if ($dispatchInputText -match '(?m)^\s+default:') { throw 'assertion_failed_dispatch_input_defaults_allow_missing_values' }
-if ($dispatchInputText -notmatch 'options:\s*\[standard, b1-compile-only, b1-package-inventory-only\]') { throw 'assertion_failed_dispatch_mode_options_invalid' }
+if ($dispatchInputText -notmatch 'options:\s*\[standard, b1-compile-only, b1-package-inventory-only, b1-dependency-audit-only\]') { throw 'assertion_failed_dispatch_mode_options_invalid' }
+if ($dispatchInputText -notmatch 'source_commit:\s*\r?\n\s+description:') { throw 'assertion_failed_dispatch_source_commit_input_missing' }
 if ($workflow -match "inputs\.test_mode\s*!=\s*'b1-compile-only'") { throw 'assertion_failed_nonexclusive_test_mode_condition' }
 $pushStart = $workflow.IndexOf('  push:')
 $pullRequestStart = $workflow.IndexOf('  pull_request:', $pushStart)
@@ -123,12 +129,13 @@ foreach ($forbidden in @('Invoke-McpVmHostController', 'Invoke-McpVmGuestHarness
 }
 if ($compileSection -match '(?im)^\s*(?:&\s*)?swift\s+test(?:\s|$)') { throw 'assertion_failed_compile_only_runs_xctest' }
 if ($compileSection -notmatch "if: inputs\.test_mode == 'b1-package-inventory-only'") { throw 'assertion_failed_inventory_step_not_mode_gated' }
+if ($compileSection -notmatch "if: inputs\.test_mode == 'b1-dependency-audit-only'") { throw 'assertion_failed_dependency_audit_step_not_mode_gated' }
 $prepareStart = $workflow.IndexOf('      - name: Prepare Windows Swift test libraries', $compileSectionStart)
 $resolveStart = $workflow.IndexOf('      - name: Resolve pinned SwiftPM dependencies', $prepareStart)
 if ($prepareStart -lt 0 -or $resolveStart -lt 0) { throw 'assertion_failed_package_inventory_prepare_step_boundary_missing' }
 $prepareSection = $workflow.Substring($prepareStart, $resolveStart - $prepareStart)
-if ($prepareSection -notmatch '(?s)if \(\$env:TEST_MODE -ceq "b1-package-inventory-only"\) \{\s+\$msvcRoot = .*?Add-Content \$env:GITHUB_ENV "MSVC_DUMPBIN_PATH=\$dumpbinPath"\s+\}') {
-  throw 'assertion_failed_dumpbin_requirement_not_limited_to_inventory_mode'
+if ($prepareSection -notmatch '(?s)if \(\$env:TEST_MODE -cin @\("b1-package-inventory-only", "b1-dependency-audit-only"\)\) \{\s+\$msvcRoot = .*?Add-Content \$env:GITHUB_ENV "MSVC_DUMPBIN_PATH=\$dumpbinPath"\s+Add-Content \$env:GITHUB_ENV "WINDOWS_MSVC_ROOT=\$msvcRoot"\s+\}') {
+  throw 'assertion_failed_dumpbin_requirement_not_limited_to_static_modes'
 }
 if ($compileSection -notmatch 'Invoke-McpSwiftBuildInventory\.ps1' -or
     $compileSection -notmatch 'INVENTORY_PASS' -or

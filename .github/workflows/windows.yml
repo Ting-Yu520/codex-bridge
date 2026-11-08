@@ -16,12 +16,16 @@ on:
         description: Test-only mode for isolated validation branches
         required: true
         type: choice
-        options: [standard, b1-compile-only, b1-package-inventory-only]
+        options: [standard, b1-compile-only, b1-package-inventory-only, b1-dependency-audit-only]
+      source_commit:
+        description: Required commit identity for B1 dependency audit mode
+        required: false
+        type: string
 permissions:
   contents: read
 
 concurrency:
-  group: windows-${{ github.ref }}-${{ inputs.architecture || 'all' }}${{ inputs.test_mode == 'b1-compile-only' && '-compile-only' || '' }}${{ inputs.test_mode == 'b1-package-inventory-only' && '-package-inventory' || '' }}
+  group: windows-${{ github.ref }}-${{ inputs.architecture || 'all' }}${{ inputs.test_mode == 'b1-compile-only' && '-compile-only' || '' }}${{ inputs.test_mode == 'b1-package-inventory-only' && '-package-inventory' || '' }}${{ inputs.test_mode == 'b1-dependency-audit-only' && '-dependency-audit' || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -49,6 +53,8 @@ jobs:
           EVENT_BASE_REF: ${{ github.base_ref }}
           TEST_MODE: ${{ inputs.test_mode }}
           ARCHITECTURE: ${{ inputs.architecture }}
+          REQUESTED_SOURCE_COMMIT: ${{ inputs.source_commit }}
+          WORKFLOW_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = 'Stop'
           Import-Module "$env:GITHUB_WORKSPACE\.github\scripts\vm\McpVmWorkflowPolicy.psm1" -Force
@@ -58,7 +64,9 @@ jobs:
             -HeadRef $env:EVENT_HEAD_REF `
             -BaseRef $env:EVENT_BASE_REF `
             -TestMode $env:TEST_MODE `
-            -Architecture $env:ARCHITECTURE
+            -Architecture $env:ARCHITECTURE `
+            -RequestedSourceCommit $env:REQUESTED_SOURCE_COMMIT `
+            -WorkflowSha $env:WORKFLOW_SHA
           if (-not $decision.valid) {
             Write-Output "DISPATCH_INPUT_STATUS=FAIL error_category=$($decision.errorCategory)"
             exit 1
@@ -749,42 +757,52 @@ jobs:
         shell: pwsh
         run: '& "$env:GITHUB_WORKSPACE\.github\scripts\guard-mcp-exe-egress.ps1" -Mode Cleanup'
 
-  # Compile-only and package-inventory validation for the Gate B1 VM process test.
-  # The optional inventory path never runs the XCTest runner or Bridge service.
+  # Compile-only and static inventory/audit validation for the Gate B1 VM process test.
+  # These modes compile test targets but never execute an XCTest or Bridge binary.
   mcp-exe-compile-only:
     needs: dispatch-input-validation
     if: needs.dispatch-input-validation.result == 'success' && needs.dispatch-input-validation.outputs.b1_compile_job == 'true'
-    name: ${{ inputs.test_mode == 'b1-package-inventory-only' && 'Gate B1 package inventory (x64)' || 'Gate B1 compile only (x64)' }}
+    name: ${{ inputs.test_mode == 'b1-package-inventory-only' && 'Gate B1 package inventory (x64)' || inputs.test_mode == 'b1-dependency-audit-only' && 'Gate B1 static dependency audit (x64)' || 'Gate B1 compile only (x64)' }}
     runs-on: windows-latest
     timeout-minutes: 90
     permissions:
+      actions: read
       contents: read
     env:
       SWIFT_VERSION: 6.3.3
       TARGET_TRIPLE: x86_64-unknown-windows-msvc
       TARGET_ARCHITECTURE: ${{ inputs.architecture }}
       TEST_MODE: ${{ inputs.test_mode }}
+      REQUESTED_SOURCE_COMMIT: ${{ inputs.source_commit }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - name: Verify compile-only dispatch boundary
+        id: compile_boundary
         shell: pwsh
         run: |
           if ($env:GITHUB_EVENT_NAME -ne "workflow_dispatch" -or
               $env:GITHUB_REF -ne "refs/heads/ci/mcp-cache-hints-exe-process-20261105" -or
               $env:TARGET_ARCHITECTURE -ne "x64" -or
-              $env:TEST_MODE -cnotin @("b1-compile-only", "b1-package-inventory-only")) {
+            $env:TEST_MODE -cnotin @("b1-compile-only", "b1-package-inventory-only", "b1-dependency-audit-only")) {
             throw "compile_or_inventory_dispatch_boundary_mismatch"
+          }
+          if ($env:TEST_MODE -ceq "b1-dependency-audit-only" -and
+              ($env:REQUESTED_SOURCE_COMMIT -notmatch '^[0-9a-fA-F]{40}$' -or
+               $env:REQUESTED_SOURCE_COMMIT -cne $env:GITHUB_SHA)) {
+            throw "dependency_audit_commit_binding_failed"
           }
           if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -ne "X64" -or
               -not [Environment]::Is64BitProcess) {
             throw "compile_only_runner_not_windows_x64"
           }
           $head = (& git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim()
-          if ($LASTEXITCODE -ne 0 -or $head -cne $env:GITHUB_SHA) {
+          if ($LASTEXITCODE -ne 0 -or $head -notmatch '^[0-9a-fA-F]{40}$' -or
+              -not [string]::Equals($head, $env:GITHUB_SHA, [StringComparison]::OrdinalIgnoreCase)) {
             throw "compile_only_checkout_sha_mismatch"
           }
+          "source_commit=$($head.ToLowerInvariant())" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
           Write-Output "PASS test=compile-only-dispatch architecture=x64 commit=$head"
       - name: Install Swift toolchain
         shell: pwsh
@@ -890,7 +908,7 @@ jobs:
           Write-Output "PASS test=swift-toolchain version=6.3.3 installer_sha256=$installerHash"
           Add-Content $env:GITHUB_ENV "SWIFT_TOOLCHAIN_VERIFIED_VERSION=$env:SWIFT_VERSION"
           Add-Content $env:GITHUB_ENV "SWIFT_TOOLCHAIN_VERIFIED_PATH_ID=$pathId"
-          if ($env:TEST_MODE -ceq "b1-package-inventory-only") {
+          if ($env:TEST_MODE -cin @("b1-package-inventory-only", "b1-dependency-audit-only")) {
             Add-Content $env:GITHUB_ENV "SWIFT_INSTALLER_SHA256=$installerHash"
           }
       - name: Prepare Windows Swift test libraries
@@ -924,7 +942,7 @@ jobs:
             throw "vcpkg_revision_unavailable"
           }
           Write-Output "PASS test=windows-swift-test-libraries architecture=x64 image=$env:ImageVersion msvc=$msvcVersion windows_sdk=$windowsSdkVersion vcpkg_revision=$vcpkgRevision sqlite_package=$($sqlitePackage[0] -replace '\s+', ' ')"
-          if ($env:TEST_MODE -ceq "b1-package-inventory-only") {
+          if ($env:TEST_MODE -cin @("b1-package-inventory-only", "b1-dependency-audit-only")) {
             $msvcRoot = Split-Path -Parent $buildEnvironment.IncludePaths[0]
             # BEGIN VCPKG SQLITE IDENTITY NORMALIZER
             function ConvertTo-VcpkgSqliteIdentity {
@@ -951,6 +969,7 @@ jobs:
             Add-Content $env:GITHUB_ENV "WINDOWS_SDK_VERSION=$windowsSdkVersion"
             Add-Content $env:GITHUB_ENV "WINDOWS_RUNNER_IMAGE=$env:ImageVersion"
             Add-Content $env:GITHUB_ENV "MSVC_DUMPBIN_PATH=$dumpbinPath"
+            Add-Content $env:GITHUB_ENV "WINDOWS_MSVC_ROOT=$msvcRoot"
           }
       - name: Resolve pinned SwiftPM dependencies
         shell: pwsh
@@ -988,7 +1007,7 @@ jobs:
             if ($after -cne $before[$path]) { throw "swiftpm_lockfile_changed" }
             Write-Output "PASS test=swiftpm-lock path=$path sha256=$($after.ToLowerInvariant())"
           }
-          if ($env:TEST_MODE -ceq "b1-package-inventory-only") {
+          if ($env:TEST_MODE -cin @("b1-package-inventory-only", "b1-dependency-audit-only")) {
             Add-Content $env:GITHUB_ENV "SWIFTPM_CORE_LOCK_SHA256=$($before['Packages/BridgeCore/Package.resolved'].ToLowerInvariant())"
             Add-Content $env:GITHUB_ENV "SWIFTPM_SDK_LOCK_SHA256=$($before['Vendor/swift-sdk/Package.resolved'].ToLowerInvariant())"
           }
@@ -1018,7 +1037,7 @@ jobs:
             -TargetTriple $env:TARGET_TRIPLE `
             -LibraryPaths ($env:TARGET_LIBRARY_PATHS -split ";"))
           $buildArguments = @($baseArguments) + @("-c", "debug", "--build-tests")
-          if ($env:TEST_MODE -ceq "b1-package-inventory-only") {
+          if ($env:TEST_MODE -cin @("b1-package-inventory-only", "b1-dependency-audit-only")) {
             $buildArgumentsBytes = [Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject ([object[]](@("build") + $buildArguments)) -Compress -Depth 3))
             $argumentSha = [Security.Cryptography.SHA256]::Create()
             try {
@@ -1061,6 +1080,21 @@ jobs:
             ${{ runner.temp }}/b1-package-inventory/SHA256SUMS.txt.sha256
           if-no-files-found: error
           retention-days: 1
+      - name: Download and verify approved Portable source for static audit
+        id: prepare_portable
+        if: inputs.test_mode == 'b1-dependency-audit-only'
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: '& "$env:GITHUB_WORKSPACE\.github\scripts\prepare-mcp-process-artifact.ps1"'
+      - name: Run static PE dependency audit without executing binaries
+        id: dependency_audit
+        if: success() && inputs.test_mode == 'b1-dependency-audit-only'
+        shell: pwsh
+        env:
+          COMPILE_STATUS: ${{ steps.compile.outputs.compile_status }}
+          REQUESTED_SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: '& "$env:GITHUB_WORKSPACE\.github\scripts\vm\Invoke-McpStaticDependencyAudit.ps1"'
       - name: Report package inventory-only status
         if: always() && inputs.test_mode == 'b1-package-inventory-only'
         shell: pwsh
@@ -1118,3 +1152,72 @@ jobs:
           Write-Output 'B1_SCHEMA_STATUS=NOT_TESTED'
           Write-Output 'B1_VM_STATUS=NOT_TESTED'
           Write-Output 'B1_GATE_STATUS=NOT_PASSED'
+      - name: Report static dependency audit status without packaging or execution
+        if: always() && inputs.test_mode == 'b1-dependency-audit-only'
+        shell: pwsh
+        env:
+          COMPILE_OUTCOME: ${{ steps.compile.outcome }}
+          COMPILE_STATUS: ${{ steps.compile.outputs.compile_status }}
+          VERIFIED_SOURCE_COMMIT: ${{ steps.compile_boundary.outputs.source_commit }}
+          PORTABLE_OUTCOME: ${{ steps.prepare_portable.outcome }}
+          AUDIT_OUTCOME: ${{ steps.dependency_audit.outcome }}
+          AUDIT_STATUS: ${{ steps.dependency_audit.outputs.audit_status }}
+          AUDIT_SOURCE_COMMIT: ${{ steps.dependency_audit.outputs.source_commit }}
+          HARNESS_GRAPH_STATUS: ${{ steps.dependency_audit.outputs.harness_graph_status }}
+          PORTABLE_GRAPH_STATUS: ${{ steps.dependency_audit.outputs.portable_graph_status }}
+          RUNNER_BUILD_ASSOCIATION: ${{ steps.dependency_audit.outputs.runner_build_association }}
+          DEPENDENCY_NODE_COUNT: ${{ steps.dependency_audit.outputs.dependency_node_count }}
+          IMPORT_EDGE_COUNT: ${{ steps.dependency_audit.outputs.import_edge_count }}
+          DELAY_IMPORT_EDGE_COUNT: ${{ steps.dependency_audit.outputs.delay_import_edge_count }}
+          UNRESOLVED_COUNT: ${{ steps.dependency_audit.outputs.unresolved_count }}
+          SOURCE_COLLISION_COUNT: ${{ steps.dependency_audit.outputs.source_collision_count }}
+          REPORT_SHA256: ${{ steps.dependency_audit.outputs.report_sha256 }}
+        run: |
+          $compilePass = $env:COMPILE_OUTCOME -ceq 'success' -and $env:COMPILE_STATUS -ceq 'PASS'
+          $portablePass = $env:PORTABLE_OUTCOME -ceq 'success'
+          $auditPass = $env:AUDIT_OUTCOME -ceq 'success' -and $env:AUDIT_STATUS -ceq 'PASS'
+          $auditStatus = if ($env:AUDIT_STATUS -cin @('PASS', 'INCOMPLETE', 'FAIL')) { $env:AUDIT_STATUS } else { 'NOT_RUN' }
+          $sourceCommit = if ($env:VERIFIED_SOURCE_COMMIT -match '^[0-9a-f]{40}$') { $env:VERIFIED_SOURCE_COMMIT } else { 'UNVERIFIED' }
+          if ($env:AUDIT_SOURCE_COMMIT -match '^[0-9a-f]{40}$' -and $env:AUDIT_SOURCE_COMMIT -cne $sourceCommit) { throw 'audit_summary_source_commit_mismatch' }
+          $harnessStatus = if ($env:HARNESS_GRAPH_STATUS -cin @('PASS', 'INCOMPLETE', 'FAIL', 'NOT_RUN')) { $env:HARNESS_GRAPH_STATUS } else { 'NOT_RUN' }
+          $portableGraphStatus = if ($env:PORTABLE_GRAPH_STATUS -cin @('PASS', 'INCOMPLETE', 'FAIL', 'NOT_RUN')) { $env:PORTABLE_GRAPH_STATUS } else { 'NOT_RUN' }
+          $runnerAssociation = if ($env:RUNNER_BUILD_ASSOCIATION -cin @('PASS', 'FAIL', 'NOT_VERIFIED')) { $env:RUNNER_BUILD_ASSOCIATION } else { 'NOT_VERIFIED' }
+          $nodeCount = if ($env:DEPENDENCY_NODE_COUNT -match '^[0-9]+$') { $env:DEPENDENCY_NODE_COUNT } else { '0' }
+          $edgeCount = if ($env:IMPORT_EDGE_COUNT -match '^[0-9]+$') { $env:IMPORT_EDGE_COUNT } else { '0' }
+          $delayEdgeCount = if ($env:DELAY_IMPORT_EDGE_COUNT -match '^[0-9]+$') { $env:DELAY_IMPORT_EDGE_COUNT } else { '0' }
+          $unresolvedCount = if ($env:UNRESOLVED_COUNT -match '^[0-9]+$') { $env:UNRESOLVED_COUNT } else { '0' }
+          $collisionCount = if ($env:SOURCE_COLLISION_COUNT -match '^[0-9]+$') { $env:SOURCE_COLLISION_COUNT } else { '0' }
+          $reportSha = if ($env:REPORT_SHA256 -match '^[0-9a-f]{64}$') { $env:REPORT_SHA256 } else { 'NOT_CREATED' }
+          $compileStatus = if ($compilePass) { 'PASS' } else { 'FAIL_OR_NOT_RUN' }
+          $portableSourceStatus = if ($portablePass) { 'PASS' } elseif ($compilePass) { 'FAIL' } else { 'NOT_RUN' }
+          $auditOutcome = if ($env:AUDIT_OUTCOME) { $env:AUDIT_OUTCOME } else { 'NOT_RUN' }
+          $summary = @(
+            '```text',
+            "COMPILE_STATUS=$compileStatus",
+            "PORTABLE_SOURCE_STATUS=$portableSourceStatus",
+            "AUDIT_STEP_OUTCOME=$auditOutcome",
+            "STATIC_IMPORT_AUDIT=$auditStatus",
+            "SOURCE_COMMIT=$sourceCommit",
+            "HARNESS_GRAPH_STATUS=$harnessStatus",
+            "PORTABLE_GRAPH_STATUS=$portableGraphStatus",
+            "RUNNER_BUILD_ASSOCIATION=$runnerAssociation",
+            "DEPENDENCY_NODE_COUNT=$nodeCount",
+            "IMPORT_EDGE_COUNT=$edgeCount",
+            "DELAY_IMPORT_EDGE_COUNT=$delayEdgeCount",
+            "UNRESOLVED_COUNT=$unresolvedCount",
+            "SOURCE_COLLISION_COUNT=$collisionCount",
+            "AUDIT_REPORT_SHA256=$reportSha",
+            'RUNNER_TEST_DISCOVERY=NOT_VERIFIED',
+            'DIRECT_RUNNER_EXECUTION=NOT_VERIFIED',
+            'DYNAMIC_DEPENDENCIES=NOT_VERIFIED',
+            'PACKAGE_BUILD_PREP_READY=NO',
+            'TEST_PACKAGE=NOT_CREATED',
+            'XCTEST=NOT_RUN',
+            'SERVICE_EXE=NOT_RUN',
+            'VM_N5=BLOCKED',
+            'GATE_B1=NOT_PASSED',
+            '```'
+          )
+          $summary | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          $summary | Where-Object { $_ -notmatch '^```$' } | Write-Output
+          if (-not ($compilePass -and $portablePass -and $auditPass)) { exit 1 }

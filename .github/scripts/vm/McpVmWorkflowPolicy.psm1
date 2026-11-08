@@ -19,14 +19,16 @@ function Get-CodexBridgeWorkflowDecision {
     [AllowEmptyString()][string]$HeadRef = '',
     [AllowEmptyString()][string]$BaseRef = '',
     [AllowEmptyString()][string]$TestMode = '',
-    [AllowEmptyString()][string]$Architecture = ''
+    [AllowEmptyString()][string]$Architecture = '',
+    [AllowEmptyString()][string]$RequestedSourceCommit = '',
+    [AllowEmptyString()][string]$WorkflowSha = ''
   )
 
   if ($EventName -ceq 'workflow_dispatch') {
     if ([string]::IsNullOrWhiteSpace($TestMode)) {
       return New-CodexBridgeWorkflowDecision $false 'dispatch_test_mode_missing' @()
     }
-    if ($TestMode -cnotin @('standard', 'b1-compile-only', 'b1-package-inventory-only')) {
+    if ($TestMode -cnotin @('standard', 'b1-compile-only', 'b1-package-inventory-only', 'b1-dependency-audit-only')) {
       return New-CodexBridgeWorkflowDecision $false 'dispatch_test_mode_invalid' @()
     }
     if ([string]::IsNullOrWhiteSpace($Architecture)) {
@@ -34,6 +36,17 @@ function Get-CodexBridgeWorkflowDecision {
     }
     if ($Architecture -cnotin @('all', 'x64', 'arm64')) {
       return New-CodexBridgeWorkflowDecision $false 'dispatch_architecture_invalid' @()
+    }
+    if ($TestMode -ceq 'b1-dependency-audit-only') {
+      if ($RequestedSourceCommit -notmatch '^[0-9a-fA-F]{40}$') {
+        return New-CodexBridgeWorkflowDecision $false 'dispatch_dependency_audit_source_commit_invalid' @()
+      }
+      if ($WorkflowSha -notmatch '^[0-9a-fA-F]{40}$') {
+        return New-CodexBridgeWorkflowDecision $false 'dispatch_dependency_audit_workflow_sha_invalid' @()
+      }
+      if (-not [string]::Equals($RequestedSourceCommit, $WorkflowSha, [StringComparison]::OrdinalIgnoreCase)) {
+        return New-CodexBridgeWorkflowDecision $false 'dispatch_dependency_audit_source_commit_mismatch' @()
+      }
     }
 
     $branch = $Ref -replace '^refs/heads/', ''
@@ -53,7 +66,9 @@ function Get-CodexBridgeWorkflowDecision {
       if ($TestMode -ceq 'standard') {
         return New-CodexBridgeWorkflowDecision $true '' @('mcp-exe-process-tests')
       }
-    if ($TestMode -ceq 'b1-compile-only' -or $TestMode -ceq 'b1-package-inventory-only') {
+      if ($TestMode -ceq 'b1-compile-only' -or
+          $TestMode -ceq 'b1-package-inventory-only' -or
+          $TestMode -ceq 'b1-dependency-audit-only') {
         return New-CodexBridgeWorkflowDecision $true '' @('mcp-exe-compile-only')
       }
       return New-CodexBridgeWorkflowDecision $false 'dispatch_gate_b1_mode_invalid' @()

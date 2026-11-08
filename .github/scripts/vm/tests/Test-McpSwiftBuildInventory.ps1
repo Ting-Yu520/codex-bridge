@@ -15,6 +15,67 @@ function Assert-ThrowsCategory([scriptblock]$Action, [string]$Category, [string]
   Assert-True ($caught.Exception.Message -like "*$Category*") "$Name-category"
 }
 
+function Assert-SensitiveInventoryPathBlocked {
+  param(
+    [hashtable]$BaseIdentity,
+    [string]$RelativePath,
+    [string]$ExpectedClassification,
+    [string]$ExpectedEntryType,
+    [string]$Sentinel
+  )
+
+  $caseId = [Guid]::NewGuid().ToString('N')
+  $caseRoot = Join-Path $BaseIdentity.BinPath 'BridgeCore_BridgeMCP.resources'
+  $caseRoot = Join-Path $caseRoot 'FileTransfer'
+  $caseRoot = Join-Path $caseRoot "s-$caseId"
+  $caseRootFull = [IO.Path]::GetFullPath($caseRoot)
+  $binRootFull = [IO.Path]::GetFullPath($BaseIdentity.BinPath).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+  if (-not $caseRootFull.StartsWith($binRootFull, [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'test_sensitive_case_root_outside_binpath'
+  }
+
+  $targetPath = Join-Path $caseRoot $RelativePath
+  $parentPath = Split-Path -Parent $targetPath
+  New-Item -ItemType Directory -Path $parentPath -Force | Out-Null
+  if ($ExpectedEntryType -ceq 'directory') {
+    New-Item -ItemType Directory -Path $targetPath -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $targetPath 'payload.bin'), $Sentinel)
+  } else {
+    [IO.File]::WriteAllText($targetPath, $Sentinel)
+  }
+  try { [void][CodexBridgePathIdentity]::Read($targetPath) } catch { throw 'test_synthetic_file_identity_unavailable' }
+
+  $caseOutput = Join-Path $BaseIdentity.RunnerTemp "inventory-sensitive-$caseId\inventory.json"
+  $caseIdentity = $BaseIdentity.Clone()
+  $caseIdentity.OutputPath = $caseOutput
+  $failureMessage = $null
+  try {
+    try { New-CodexBridgeBuildInventory @caseIdentity | Out-Null } catch { $failureMessage = $_.Exception.Message }
+    Assert-True ($null -ne $failureMessage) "sensitive-$ExpectedClassification-is-blocked"
+    $failureCategory = if ($failureMessage -match 'inventory_[A-Za-z0-9_]+') { $Matches[0] } else { 'unclassified_error' }
+    Assert-True ($failureCategory -ceq 'inventory_sensitive_filename_blocked') "sensitive-$ExpectedClassification-failure-category-$failureCategory"
+    Assert-True ($failureMessage.Contains('inventory_sensitive_filename_blocked')) "sensitive-$ExpectedClassification-keeps-existing-failure-category"
+    Assert-True ($failureMessage.Contains("classification=$ExpectedClassification")) "sensitive-$ExpectedClassification-safe-classification-is-reported"
+    Assert-True ($failureMessage.Contains("entry_type=$ExpectedEntryType")) "sensitive-$ExpectedClassification-entry-type-is-reported"
+    Assert-True (-not $failureMessage.Contains($RelativePath)) "sensitive-$ExpectedClassification-path-is-not-reported"
+    Assert-True (-not $failureMessage.Contains($Sentinel)) "sensitive-$ExpectedClassification-content-is-not-reported"
+    Assert-True (-not (Test-Path -LiteralPath $caseOutput -PathType Leaf)) "sensitive-$ExpectedClassification-manifest-is-not-created"
+    return $failureMessage
+  } finally {
+    if (Test-Path -LiteralPath $caseRootFull) {
+      Remove-Item -LiteralPath $caseRootFull -Recurse -Force -ErrorAction Stop
+    }
+    $caseOutputDirectory = Split-Path -Parent ([IO.Path]::GetFullPath($caseOutput))
+    $runnerTempFull = [IO.Path]::GetFullPath($BaseIdentity.RunnerTemp).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    if (-not $caseOutputDirectory.StartsWith($runnerTempFull, [StringComparison]::OrdinalIgnoreCase)) {
+      throw 'test_sensitive_case_output_outside_runner_temp'
+    }
+    if (Test-Path -LiteralPath $caseOutputDirectory -PathType Container) {
+      Remove-Item -LiteralPath $caseOutputDirectory -Recurse -Force -ErrorAction Stop
+    }
+  }
+}
+
 $workflowPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..\workflows\windows.yml'))
 $workflowText = [IO.File]::ReadAllText($workflowPath)
 $workflowLines = $workflowText -split "`r?`n"
@@ -93,7 +154,7 @@ function Write-SyntheticPE([string]$Path, [UInt16]$Machine) {
   [IO.File]::WriteAllBytes($Path, $bytes)
 }
 
-$tempBase = Join-Path ([IO.Path]::GetTempPath()) 'codex-bridge-package-inventory-tests'
+$tempBase = Join-Path ([IO.Path]::GetTempPath()) 'cb-bridge-inv'
 $testRoot = Join-Path $tempBase ([Guid]::NewGuid().ToString('N'))
 $workspace = Join-Path $testRoot 'workspace'
 $binPath = Join-Path $workspace 'Packages\BridgeCore\.build\x86_64-unknown-windows-msvc\debug'
@@ -101,7 +162,10 @@ $runnerTemp = Join-Path $testRoot 'runner-temp'
 $outputPath = Join-Path $runnerTemp 'inventory\inventory.json'
 
 New-Item -ItemType Directory -Path $binPath -Force | Out-Null
-New-Item -ItemType Directory -Path (Join-Path $binPath 'BridgeMCP.resources\FileTransfer') -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $binPath 'BridgeCore_BridgeMCP.resources\FileTransfer') -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $binPath 'BridgeCore_BridgeMCP.resources\LooseData') -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $binPath 'Modules') -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $binPath 'Unverified.resources') -Force | Out-Null
 New-Item -ItemType Directory -Path $runnerTemp -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $workspace '.github\schemas') -Force | Out-Null
 $testRunner = Join-Path $binPath 'BridgeMCPTests.exe'
@@ -114,13 +178,27 @@ $schemaInput = Join-Path $workspace '.github\schemas\mcp-2026-07-28.json'
 Write-SyntheticPE $testRunner 0x8664
 Write-SyntheticPE $ordinaryExe 0x8664
 Write-SyntheticPE $xctestRuntime 0x8664
-[IO.File]::WriteAllText((Join-Path $binPath 'BridgeMCP.resources\FileTransfer\index.html'), 'synthetic resource')
+[IO.File]::WriteAllText((Join-Path $binPath 'BridgeCore_BridgeMCP.resources\FileTransfer\index.html'), 'synthetic resource')
+[IO.File]::WriteAllText((Join-Path $binPath 'BridgeCore_BridgeMCP.resources\LooseData\extra.dat'), 'SYNTHETIC_UNDECLARED_RESOURCE_CONTENT')
 [IO.File]::WriteAllText((Join-Path $binPath 'unknown-artifact.dat'), 'synthetic unknown')
+[IO.File]::WriteAllText((Join-Path $binPath 'Modules\Token.swiftmodule'), 'SYNTHETIC_INTERMEDIATE_CONTENT')
+[IO.File]::WriteAllText((Join-Path $binPath 'Unverified.resources\unreviewed.dat'), 'SYNTHETIC_UNVERIFIED_RESOURCE_CONTENT')
 [IO.File]::WriteAllText($packageManifest, @'
 import PackageDescription
-let package = Package(name: "BridgeCore", targets: [
-  .testTarget(name: "BridgeMCPTests", dependencies: [])
-])
+let package = Package(
+  name: "BridgeCore",
+  targets: [
+    .target(
+      name: "BridgeMCP",
+      dependencies: [],
+      resources: [.copy("Resources/FileTransfer")]
+    ),
+    .testTarget(
+      name: "BridgeMCPTests",
+      dependencies: ["BridgeMCP"]
+    )
+  ]
+)
 '@)
 [IO.File]::WriteAllText($schemaInput, '{"protocolVersion":"2026-07-28","synthetic":true}')
 $syntheticSchemaHash = (Get-FileHash -LiteralPath $schemaInput -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -157,6 +235,13 @@ $identity = @{
 $created = New-CodexBridgeBuildInventory @identity
 $manifestJson = Get-Content -LiteralPath $outputPath -Raw
 $manifest = $manifestJson | ConvertFrom-Json
+$excludedFixturePaths = @(
+  (Join-Path $binPath 'Modules\Token.swiftmodule'),
+  (Join-Path $binPath 'unknown-artifact.dat'),
+  (Join-Path $binPath 'Unverified.resources\unreviewed.dat'),
+  (Join-Path $binPath 'BridgeCore_BridgeMCP.resources\LooseData\extra.dat')
+)
+$excludedFixtureHashes = @($excludedFixturePaths | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant() })
 $schemaOutputPath = Join-Path (Split-Path -Parent $outputPath) 'mcp-2026-07-28.json'
 $sumsPath = Join-Path (Split-Path -Parent $outputPath) 'SHA256SUMS.txt'
 $sumsShaPath = "$sumsPath.sha256"
@@ -172,12 +257,18 @@ Assert-True ($manifest.swiftpmLocks.bridgeCorePackageResolvedSha256 -ceq ('d' * 
 Assert-True ($manifest.swiftpmLocks.vendoredMcpSdkPackageResolvedSha256 -ceq ('e' * 64)) 'mcp-sdk-lock-hash-recorded'
 Assert-True ($manifest.protocolSchema.protocolVersion -ceq '2026-07-28') 'schema-version-recorded'
 Assert-True ($manifest.protocolSchema.sha256 -ceq $syntheticSchemaHash) 'schema-hash-recorded'
-Assert-True ($manifest.candidateFiles.Count -eq 5) 'all-binpath-files-inventoried'
-Assert-True (@($manifest.candidateFiles | Where-Object { $_.sha256 -notmatch '^[0-9a-f]{64}$' }).Count -eq 0) 'all-files-hashed'
+Assert-True ($manifest.inventoryScope -ceq 'SCOPED_RUNTIME_CANDIDATES') 'inventory-scope-is-explicit'
+Assert-True ($manifest.coverageStatus -ceq 'COVERAGE_UNRESOLVED') 'coverage-is-not-claimed-complete'
+Assert-True ($manifest.runtimeDependencyClosure -ceq 'NOT_VERIFIED') 'runtime-dependency-closure-is-not-claimed'
+Assert-True ($manifest.candidateFiles.Count -eq 4) 'only-scoped-runtime-candidates-are-inventoried'
+Assert-True ($manifest.outOfScopeFileCount -eq 4) 'out-of-scope-files-are-counted-only'
+Assert-True (@($manifest.candidateFiles | Where-Object { $_.sha256 -notmatch '^[0-9a-f]{64}$' }).Count -eq 0) 'scoped-candidates-have-hashes'
 Assert-True (@($manifest.candidateFiles | Where-Object { $_.extension -in @('.exe', '.dll') -and ($_.fileType -notin @('candidate-xctest-runner', 'ordinary-exe', 'dll') -or $_.peMachine -cne 'AMD64') }).Count -eq 0) 'pe-candidates-are-x64'
 Assert-True (@($manifest.candidateFiles | Where-Object { $_.extension -eq '.exe' -and $_.imports -notcontains 'swiftcore.dll' }).Count -eq 0) 'pe-imports-inventoried'
 Assert-True ($manifest.packageEligible -eq $false) 'inventory-never-claims-package-ready'
+Assert-True ($manifest.testPackageStatus -ceq 'NOT_CREATED') 'test-package-remains-not-created'
 Assert-True ($manifest.executableClassification -ceq 'UNRESOLVED') 'executable-classification-remains-unresolved'
+Assert-True ($manifest.gateB1Status -ceq 'NOT_PASSED') 'gate-b1-remains-not-passed'
 Assert-True ($manifest.buildPath.configuration -ceq 'debug') 'debug-configuration-recorded'
 Assert-True ($manifest.buildPath.targetTriple -ceq 'x86_64-unknown-windows-msvc') 'target-triple-recorded'
 Assert-True ($manifest.buildPath.debugBinPathQueryArgumentsSha256 -ceq ('3' * 64)) 'debug-binpath-query-arguments-recorded'
@@ -185,14 +276,32 @@ Assert-True ($manifest.buildPath.releaseBinPathQueryArgumentsSha256 -ceq ('4' * 
 Assert-True (@($manifest.candidateFiles | Where-Object { $_.fileType -ceq 'candidate-xctest-runner' }).Count -eq 1) 'test-target-match-is-only-a-runner-candidate'
 Assert-True (@($manifest.candidateFiles | Where-Object { $_.path -ceq 'bridge-helper.exe' -and $_.fileType -ceq 'ordinary-exe' }).Count -eq 1) 'ordinary-exe-is-not-test-runner'
 Assert-True (@($manifest.candidateFiles | Where-Object { $_.path -ceq 'XCTest.dll' -and $_.fileType -ceq 'dll' }).Count -eq 1) 'dll-has-independent-category'
-Assert-True (@($manifest.candidateFiles | Where-Object { $_.path -match '\.resources/' -and $_.fileType -ceq 'resource' }).Count -eq 1) 'resource-bundle-file-is-classified'
-Assert-True (@($manifest.candidateFiles | Where-Object { $_.path -ceq 'unknown-artifact.dat' -and $_.fileType -ceq 'unclassified' }).Count -eq 1) 'unknown-file-is-unclassified'
+Assert-True (@($manifest.candidateFiles | Where-Object { $_.path -ceq 'BridgeCore_BridgeMCP.resources/FileTransfer/index.html' -and $_.fileType -ceq 'resource' }).Count -eq 1) 'manifest-declared-test-dependency-resource-is-classified'
+Assert-True (@($manifest.declaredTestResourceBundles | Where-Object { $_.bundleName -ceq 'BridgeCore_BridgeMCP.resources' -and $_.resourceEntry -ceq 'FileTransfer' }).Count -eq 1) 'resource-bundle-evidence-includes-declared-copy-root'
+Assert-True (@($manifest.candidateFiles | Where-Object { $_.path -match 'Token\.swiftmodule$' -or $_.path -ceq 'unknown-artifact.dat' -or $_.path -match 'Unverified\.resources' }).Count -eq 0) 'out-of-scope-files-have-no-paths'
+Assert-True (-not $manifestJson.Contains('SYNTHETIC_INTERMEDIATE_CONTENT')) 'intermediate-content-is-not-serialized'
+Assert-True (-not $manifestJson.Contains('SYNTHETIC_UNVERIFIED_RESOURCE_CONTENT')) 'unverified-resource-content-is-not-serialized'
+Assert-True (-not $manifestJson.Contains('SYNTHETIC_UNDECLARED_RESOURCE_CONTENT')) 'undeclared-subtree-content-is-not-serialized'
+Assert-True (-not $manifestJson.Contains('unknown-artifact.dat')) 'out-of-scope-filename-is-not-serialized'
+Assert-True (-not $manifestJson.Contains('Token.swiftmodule')) 'intermediate-filename-is-not-serialized'
+Assert-True (-not $manifestJson.Contains('Unverified.resources')) 'unverified-resource-path-is-not-serialized'
+Assert-True (-not $manifestJson.Contains('LooseData')) 'undeclared-resource-subtree-path-is-not-serialized'
+Assert-True (@($excludedFixtureHashes | Where-Object { $manifestJson.Contains($_) }).Count -eq 0) 'out-of-scope-sha256-values-are-not-serialized'
+Assert-True ($manifest.totalSizeBytes -eq [long](($manifest.candidateFiles | Measure-Object -Property sizeBytes -Sum).Sum)) 'size-total-covers-only-scoped-candidates'
 Assert-True (-not $manifestJson.Contains($testRoot)) 'absolute-host-path-not-recorded'
 Assert-True ((Get-FileHash -LiteralPath $schemaOutputPath -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $syntheticSchemaHash) 'schema-is-copied-byte-exact'
 Assert-True ($sumsContent.Contains("$($created.manifestSha256)  inventory.json")) 'manifest-hash-in-sums'
 Assert-True ($sumsContent.Contains("$syntheticSchemaHash  mcp-2026-07-28.json")) 'schema-hash-in-sums'
 Assert-True ($sumsShaContent.Trim() -ceq "$($created.sumsSha256)  SHA256SUMS.txt") 'sums-sidecar-matches-file-hash'
 Assert-True ($created.sumsChecksumFileSha256 -ceq (Get-FileHash -LiteralPath $sumsShaPath -Algorithm SHA256).Hash.ToLowerInvariant()) 'sums-sidecar-hash-recorded'
+$artifactNames = @(Get-ChildItem -LiteralPath (Split-Path -Parent $outputPath) -File | Select-Object -ExpandProperty Name)
+$expectedArtifactNames = @('inventory.json', 'mcp-2026-07-28.json', 'SHA256SUMS.txt', 'SHA256SUMS.txt.sha256')
+$artifactNameDifferences = @(Compare-Object -ReferenceObject $expectedArtifactNames -DifferenceObject $artifactNames -CaseSensitive)
+Assert-True ($artifactNames.Count -eq 4 -and $artifactNameDifferences.Count -eq 0) 'artifact-directory-remains-four-file-whitelist'
+$actualPackageManifest = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..\..\Packages\BridgeCore\Package.swift'))
+$inventoryModule = Get-Module McpSwiftBuildInventory
+$actualResourceEvidence = @(& $inventoryModule { param($path) Get-CodexBridgeDeclaredTestResourceBundles $path } $actualPackageManifest)
+Assert-True (@($actualResourceEvidence | Where-Object { $_.bundleName -ceq 'BridgeCore_BridgeMCP.resources' -and $_.resourceEntry -ceq 'FileTransfer' -and $_.targetName -ceq 'BridgeMCP' }).Count -eq 1) 'actual-package-manifest-supports-resource-candidate'
 Write-Output 'PASS test=inventory-captures-relative-file-hashes'
 
 Assert-ThrowsCategory {
@@ -226,6 +335,38 @@ if ($junctionCreated) {
       Remove-Item -LiteralPath $junctionPath -Force -ErrorAction Stop
     }
   }
+}
+
+$symbolicLinkTarget = Join-Path $binPath 'synthetic-link-target.bin'
+$symbolicLinkPath = Join-Path $binPath 'synthetic-link-alias.bin'
+[IO.File]::WriteAllText($symbolicLinkTarget, 'synthetic symlink target')
+$symbolicLinkCreated = $false
+try {
+  New-Item -ItemType SymbolicLink -Path $symbolicLinkPath -Target $symbolicLinkTarget -ErrorAction Stop | Out-Null
+  $symbolicLinkCreated = $true
+} catch {
+  Write-Output 'NOT_TESTED test=inventory-file-symlink-rejection reason=creation_not_permitted'
+}
+if ($symbolicLinkCreated) {
+  try {
+    $symbolicLinkIdentity = $identity.Clone()
+    $symbolicLinkIdentity.OutputPath = Join-Path $runnerTemp 'inventory-file-symlink\inventory.json'
+    Assert-ThrowsCategory {
+      New-CodexBridgeBuildInventory @symbolicLinkIdentity
+    } 'inventory_reparse_point_not_allowed' 'file-symbolic-link-is-rejected-before-inventory'
+    Assert-True (-not (Test-Path -LiteralPath $symbolicLinkIdentity.OutputPath -PathType Leaf)) 'file-symbolic-link-does-not-create-manifest'
+    Write-Output 'PASS test=inventory-rejects-file-symbolic-link'
+  } finally {
+    $symbolicLinkItem = Get-Item -LiteralPath $symbolicLinkPath -Force -ErrorAction SilentlyContinue
+    if ($symbolicLinkItem -and ($symbolicLinkItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+      Remove-Item -LiteralPath $symbolicLinkPath -Force -ErrorAction Stop
+    }
+    if (Test-Path -LiteralPath $symbolicLinkTarget -PathType Leaf) {
+      Remove-Item -LiteralPath $symbolicLinkTarget -Force -ErrorAction Stop
+    }
+  }
+} elseif (Test-Path -LiteralPath $symbolicLinkTarget -PathType Leaf) {
+  Remove-Item -LiteralPath $symbolicLinkTarget -Force -ErrorAction Stop
 }
 
 Assert-ThrowsCategory {
@@ -267,15 +408,109 @@ Assert-ThrowsCategory {
 } 'inventory_dumpbin_failed' 'nonzero-dumpbin-is-rejected'
 Write-Output 'PASS test=inventory-rejects-dumpbin-failure'
 
-$sensitiveName = Join-Path $binPath 'runtime-key-material.txt'
-[IO.File]::WriteAllText($sensitiveName, 'synthetic name only')
-Assert-ThrowsCategory {
-  $invalidNames = $identity.Clone()
-  $invalidNames.OutputPath = Join-Path $runnerTemp 'inventory-sensitive\inventory.json'
-  New-CodexBridgeBuildInventory @invalidNames
-} 'inventory_sensitive_filename_blocked' 'sensitive-looking-path-is-rejected'
-Write-Output 'PASS test=inventory-rejects-sensitive-looking-filename'
-Remove-Item -LiteralPath $sensitiveName -Force
+$syntheticSensitiveContent = 'SYNTHETIC_SECRET_SENTINEL_MUST_NOT_ENTER_MANIFEST'
+$sensitivePathCases = @(
+  [pscustomobject]@{ RelativePath = 'runtime-key.json'; Classification = 'runtime_key_keyword'; EntryType = 'file' }
+  [pscustomobject]@{ RelativePath = 'Token.resource'; Classification = 'token_keyword'; EntryType = 'file' }
+  [pscustomobject]@{ RelativePath = 'opaque-cookie.blob'; Classification = 'cookie_keyword'; EntryType = 'file' }
+  [pscustomobject]@{ RelativePath = 'API_KEY.cache'; Classification = 'api_key_keyword'; EntryType = 'file' }
+  [pscustomobject]@{ RelativePath = 'Api-Key.cache'; Classification = 'api_key_keyword'; EntryType = 'file' }
+  [pscustomobject]@{ RelativePath = 'Api.Key.cache'; Classification = 'api_key_keyword'; EntryType = 'file' }
+  [pscustomobject]@{ RelativePath = 'apikey.cache'; Classification = 'api_key_keyword'; EntryType = 'file' }
+  [pscustomobject]@{ RelativePath = 'nested\Runtime_Key'; Classification = 'runtime_key_keyword'; EntryType = 'file' }
+  [pscustomobject]@{ RelativePath = 'nested/Secret'; Classification = 'secret_keyword'; EntryType = 'file' }
+)
+foreach ($case in $sensitivePathCases) {
+  $failureMessage = Assert-SensitiveInventoryPathBlocked `
+    -BaseIdentity $identity `
+    -RelativePath $case.RelativePath `
+    -ExpectedClassification $case.Classification `
+    -ExpectedEntryType $case.EntryType `
+    -Sentinel $syntheticSensitiveContent
+}
+Assert-True (-not $manifestJson.Contains($syntheticSensitiveContent)) 'sensitive-content-never-enters-completed-manifest'
+Write-Output 'PASS test=sensitive-path-cases executed=9 failures=0'
+
+$binPrefix = [IO.Path]::GetFullPath($binPath).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+$runnerPrefix = [IO.Path]::GetFullPath($runnerTemp).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+$nonSeparatorCaseId = [Guid]::NewGuid().ToString('N')
+$nonSeparatorRoot = Join-Path $binPath "synthetic-name-$nonSeparatorCaseId"
+$nonSeparatorFile = Join-Path $nonSeparatorRoot 'apiXkey.swiftmodule'
+$nonSeparatorSentinel = 'SYNTHETIC_NONCREDENTIAL_MODULE_CONTENT'
+$nonSeparatorOutputDirectory = Join-Path $runnerTemp "inventory-name-$nonSeparatorCaseId"
+$nonSeparatorIdentity = $identity.Clone()
+$nonSeparatorIdentity.OutputPath = Join-Path $nonSeparatorOutputDirectory 'inventory.json'
+$nonSeparatorRootFull = [IO.Path]::GetFullPath($nonSeparatorRoot)
+$nonSeparatorOutputFull = [IO.Path]::GetFullPath($nonSeparatorOutputDirectory)
+if (-not $nonSeparatorRootFull.StartsWith($binPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+    -not $nonSeparatorOutputFull.StartsWith($runnerPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+  throw 'test_nonseparator_case_path_outside_owned_roots'
+}
+try {
+  New-Item -ItemType Directory -Path $nonSeparatorRootFull -Force | Out-Null
+  [IO.File]::WriteAllText($nonSeparatorFile, $nonSeparatorSentinel)
+  $nonSeparatorResult = New-CodexBridgeBuildInventory @nonSeparatorIdentity
+  $nonSeparatorManifest = Get-Content -LiteralPath $nonSeparatorIdentity.OutputPath -Raw | ConvertFrom-Json
+  Assert-True ($nonSeparatorResult.created -eq $true) 'nonseparator-api-key-like-name-is-not-treated-as-sensitive-keyword'
+  Assert-True (@($nonSeparatorManifest.candidateFiles | Where-Object { $_.path -match 'apiXkey\.swiftmodule$' }).Count -eq 0) 'neutral-swiftmodule-name-remains-out-of-scope'
+  Assert-True ($nonSeparatorManifest.outOfScopeFileCount -ge 1) 'neutral-name-does-not-promote-file-into-inventory'
+  Assert-True (-not (Get-Content -LiteralPath $nonSeparatorIdentity.OutputPath -Raw).Contains($nonSeparatorSentinel)) 'nonseparator-file-content-is-not-serialized'
+  Assert-True (-not (Get-Content -LiteralPath $nonSeparatorIdentity.OutputPath -Raw).Contains('apiXkey.swiftmodule')) 'neutral-name-and-hash-are-not-in-manifest'
+  Write-Output 'PASS test=neutral-rename-remains-out-of-scope'
+} finally {
+  if (Test-Path -LiteralPath $nonSeparatorRootFull) { Remove-Item -LiteralPath $nonSeparatorRootFull -Recurse -Force -ErrorAction Stop }
+  if (Test-Path -LiteralPath $nonSeparatorOutputFull -PathType Container) { Remove-Item -LiteralPath $nonSeparatorOutputFull -Recurse -Force -ErrorAction Stop }
+}
+
+$unknownPePath = Join-Path $binPath 'unclassified-payload.bin'
+$unknownPeOutput = Join-Path $runnerTemp 'unknown-pe\inventory.json'
+try {
+  Write-SyntheticPE $unknownPePath 0x8664
+  $unknownPeIdentity = $identity.Clone()
+  $unknownPeIdentity.OutputPath = $unknownPeOutput
+  $unknownPeFailureMessage = $null
+  try { New-CodexBridgeBuildInventory @unknownPeIdentity | Out-Null } catch { $unknownPeFailureMessage = $_.Exception.Message }
+  Assert-True ($null -ne $unknownPeFailureMessage -and $unknownPeFailureMessage.Contains('inventory_pe_file_type_unclassified')) 'unknown-pe-is-not-silently-omitted'
+  Assert-True (-not $unknownPeFailureMessage.Contains('unclassified-payload.bin')) 'unknown-pe-error-does-not-reveal-filename'
+  Assert-True (-not (Test-Path -LiteralPath $unknownPeOutput -PathType Leaf)) 'unknown-pe-does-not-create-manifest'
+  Write-Output 'PASS test=inventory-rejects-unknown-pe-type'
+} finally {
+  if (Test-Path -LiteralPath $unknownPePath -PathType Leaf) { Remove-Item -LiteralPath $unknownPePath -Force -ErrorAction Stop }
+}
+
+$renameCaseId = [Guid]::NewGuid().ToString('N')
+$renameRoot = Join-Path $binPath "synthetic-rename-$renameCaseId"
+$renameRootFull = [IO.Path]::GetFullPath($renameRoot)
+$renamedFile = Join-Path $renameRoot 'renamed.bin'
+$renamedSentinel = 'SYNTHETIC_RENAMED_CONTENT_MUST_NOT_ENTER_MANIFEST'
+$renameOutputDirectory = Join-Path $runnerTemp "inventory-renamed-$renameCaseId"
+$renamedIdentity = $identity.Clone()
+$renamedIdentity.OutputPath = Join-Path $renameOutputDirectory 'inventory.json'
+if (-not $renameRootFull.StartsWith($binPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+    -not [IO.Path]::GetFullPath($renameOutputDirectory).StartsWith($runnerPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+  throw 'test_rename_case_path_outside_owned_roots'
+}
+try {
+  New-Item -ItemType Directory -Path $renameRootFull -Force | Out-Null
+  [IO.File]::WriteAllText($renamedFile, $renamedSentinel)
+  $renamedResult = New-CodexBridgeBuildInventory @renamedIdentity
+  $renamedManifestJson = Get-Content -LiteralPath $renamedIdentity.OutputPath -Raw
+  $renamedManifest = $renamedManifestJson | ConvertFrom-Json
+  Assert-True ($renamedResult.created -eq $true) 'scoped-inventory-created-with-out-of-scope-file'
+  Assert-True ($renamedManifest.inventoryScope -ceq 'SCOPED_RUNTIME_CANDIDATES') 'neutral-rename-does-not-change-inventory-scope'
+  Assert-True (@($renamedManifest.candidateFiles | Where-Object { $_.path -ceq 'renamed.bin' }).Count -eq 0) 'neutral-rename-does-not-enter-candidate-list'
+  Assert-True ($renamedManifest.outOfScopeFileCount -ge 1) 'neutral-rename-is-represented-only-by-aggregate-count'
+  Assert-True (-not $renamedManifestJson.Contains($renamedSentinel)) 'renamed-sensitive-content-is-not-serialized'
+  Assert-True (-not $renamedManifestJson.Contains('renamed.bin')) 'neutral-rename-filename-and-hash-are-not-serialized'
+  Write-Output 'PASS test=neutral-rename-remains-out-of-scope-content-not-inspected'
+} finally {
+  if (Test-Path -LiteralPath $renameRootFull) {
+    Remove-Item -LiteralPath $renameRootFull -Recurse -Force -ErrorAction Stop
+  }
+  if (Test-Path -LiteralPath $renameOutputDirectory -PathType Container) {
+    Remove-Item -LiteralPath $renameOutputDirectory -Recurse -Force -ErrorAction Stop
+  }
+}
 
 $wrongSchema = $identity.Clone()
 $wrongSchema.OutputPath = Join-Path $runnerTemp 'schema-mismatch\inventory.json'
@@ -299,5 +534,5 @@ if (-not $resolvedRoot.StartsWith($resolvedBase, [StringComparison]::OrdinalIgno
   throw 'test_cleanup_path_outside_owned_temp_root'
 }
 Remove-Item -LiteralPath $testRoot -Recurse -Force
-$executed = if ($junctionCreated) { 11 } else { 10 }
+$executed = 20 + [int]$junctionCreated + [int]$symbolicLinkCreated
 Write-Output "PASS test=package-inventory-synthetic-summary executed=$executed failures=0"

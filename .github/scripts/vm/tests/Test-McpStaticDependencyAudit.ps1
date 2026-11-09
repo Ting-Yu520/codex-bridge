@@ -5,6 +5,29 @@ $modulePath = Join-Path $PSScriptRoot '..\McpStaticDependencyAudit.psm1'
 Import-Module $modulePath -Force
 $fixedSchemaPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..\schemas\mcp-2026-07-28.json'))
 $fixedSchemaSha256 = 'EF70B61F99B6D2E5E3B46863822EAB08DFF6A45BEDC7A08914E0E5B133F40203'.ToLowerInvariant()
+$entrypointPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\Invoke-McpStaticDependencyAudit.ps1'))
+$entrypointTokens = $null
+$entrypointParseErrors = $null
+$entrypointAst = [System.Management.Automation.Language.Parser]::ParseFile($entrypointPath, [ref]$entrypointTokens, [ref]$entrypointParseErrors)
+if ($entrypointParseErrors.Count -gt 0) { throw 'assertion_failed_audit_entrypoint_ast_parse' }
+$pathFunctionNames = @('Get-ArgumentListSha256', 'Get-VerifiedBinPath')
+$pathFunctionAsts = @($entrypointAst.FindAll({
+  param($node)
+  $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $pathFunctionNames -contains $node.Name
+}, $true))
+if (@($pathFunctionAsts.Name | Select-Object -Unique).Count -ne $pathFunctionNames.Count) {
+  throw 'assertion_failed_production_binpath_functions_missing'
+}
+foreach ($pathFunctionAst in $pathFunctionAsts) {
+  . ([scriptblock]::Create($pathFunctionAst.Extent.Text))
+}
+$binPathPairGuardAst = @($entrypointAst.FindAll({
+  param($node)
+  $node -is [System.Management.Automation.Language.IfStatementAst] -and
+    $node.Extent.Text -match 'audit_debug_release_binpath_ambiguous'
+}, $true) | Select-Object -First 1)
+if ($binPathPairGuardAst.Count -ne 1) { throw 'assertion_failed_production_binpath_pair_guard_missing' }
+$script:ProductionBinPathPairGuard = [scriptblock]::Create($binPathPairGuardAst[0].Extent.Text)
 
 function Assert-True([bool]$Value, [string]$Name) {
   if (-not $Value) { throw "assertion_failed_$Name" }
@@ -15,9 +38,104 @@ function Assert-Equal([string]$Actual, [string]$Expected, [string]$Name) {
 }
 
 $script:passed = 0
+$script:notTested = 0
 function Complete-Test([string]$Name) {
   $script:passed++
   Write-Output "PASS test=$Name"
+}
+
+function Mark-NotTested([string]$Name, [string]$Reason) {
+  $script:notTested++
+  Write-Output "NOT_TESTED test=$Name reason=$Reason"
+}
+
+function Invoke-SyntheticSwiftBinPathQuery {
+  $swiftArguments = @($args | ForEach-Object { [string]$_ })
+  $configurationIndex = [Array]::IndexOf([string[]]$swiftArguments, '-c')
+  if ($configurationIndex -lt 0 -or $configurationIndex + 1 -ge $swiftArguments.Count) {
+    $global:LASTEXITCODE = 89
+    Write-Output 'synthetic_swift_configuration_missing'
+    return
+  }
+  $configuration = $swiftArguments[$configurationIndex + 1]
+  $script:MockSwiftArguments[$configuration] = $swiftArguments
+  $global:LASTEXITCODE = [int]$script:MockSwiftExitCodes[$configuration]
+  if ($global:LASTEXITCODE -ne 0) {
+    Write-Output 'synthetic_swift_query_failure'
+    return
+  }
+  foreach ($line in @($script:MockSwiftOutputs[$configuration])) { Write-Output ([string]$line) }
+}
+
+function New-BinPathFixture {
+  $root = Join-Path $env:TEMP ('codex-bridge-binpath-' + [Guid]::NewGuid().ToString('N'))
+  $workspace = Join-Path $root 'workspace'
+  $buildRoot = Join-Path $workspace 'Packages\BridgeCore\.build'
+  $targetRoot = Join-Path $buildRoot 'synthetic-target'
+  $debugPath = Join-Path $targetRoot 'debug'
+  $releasePath = Join-Path $targetRoot 'release'
+  $outsidePath = Join-Path $root 'outside\release'
+  New-Item -ItemType Directory -Path $debugPath -Force | Out-Null
+  New-Item -ItemType Directory -Path $outsidePath -Force | Out-Null
+  return [pscustomobject]@{
+    Root = $root
+    WorkspaceRoot = $workspace
+    BuildRoot = $buildRoot
+    TargetRoot = $targetRoot
+    DebugPath = $debugPath
+    ReleasePath = $releasePath
+    OutsidePath = $outsidePath
+  }
+}
+
+function Remove-BinPathFixture($Fixture) {
+  $tempRoot = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\') + '\'
+  $fixtureRoot = [IO.Path]::GetFullPath([string]$Fixture.Root)
+  if (-not $fixtureRoot.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -or
+      [IO.Path]::GetFileName($fixtureRoot) -notmatch '^codex-bridge-binpath-[0-9a-f]{32}$') {
+    throw 'assertion_failed_binpath_fixture_cleanup_boundary'
+  }
+  if (Test-Path -LiteralPath $fixtureRoot) { Remove-Item -LiteralPath $fixtureRoot -Recurse -Force }
+}
+
+function Set-SyntheticBinPathResponses($Fixture) {
+  $script:MockSwiftOutputs = @{
+    debug = @([string]$Fixture.DebugPath)
+    release = @([string]$Fixture.ReleasePath)
+  }
+  $script:MockSwiftExitCodes = @{ debug = 0; release = 0 }
+  $script:MockSwiftArguments = @{}
+}
+
+function Invoke-SyntheticBinPathQuery($Fixture, [string]$Configuration, [switch]$AllowMissingFinalDirectoryForComparison) {
+  $parameters = @{
+    Configuration = $Configuration
+    BaseArguments = @('-target', 'x86_64-unknown-windows-msvc')
+    SwiftExecutable = 'Invoke-SyntheticSwiftBinPathQuery'
+    WorkspaceRoot = [string]$Fixture.WorkspaceRoot
+  }
+  if ($AllowMissingFinalDirectoryForComparison) {
+    $parameters.AllowMissingFinalDirectoryForComparison = $true
+  }
+  return Get-VerifiedBinPath @parameters
+}
+
+function Invoke-SyntheticBinPathPair($Fixture) {
+  Set-SyntheticBinPathResponses $Fixture
+  $debug = Invoke-SyntheticBinPathQuery $Fixture 'debug'
+  $release = Invoke-SyntheticBinPathQuery $Fixture 'release' -AllowMissingFinalDirectoryForComparison
+  $debugBin = $debug
+  $releaseBin = $release
+  . $script:ProductionBinPathPairGuard
+  return [pscustomobject]@{ Debug = $debug; Release = $release }
+}
+
+function Assert-BinPathFailure([scriptblock]$Action, [string]$ExpectedCategory, [string]$Name) {
+  $actualCategory = $null
+  try { & $Action | Out-Null } catch { $actualCategory = [string]$_.Exception.Message }
+  $allowedCategories = @($ExpectedCategory -split '\|')
+  if ($actualCategory -cnotin $allowedCategories) { throw "assertion_failed_${Name}_failure_category" }
+  Complete-Test $Name
 }
 
 function New-SyntheticPE([string]$Path, [UInt16]$Machine = 0x8664, [string]$Payload = 'synthetic-pe') {
@@ -417,6 +535,224 @@ try {
   if ($_.Exception.Message -cne 'audit_dumpbin_output_limit_exceeded') { throw }
   Complete-Test 'dumpbin-parser-output-bound'
 }
+
+$defaultReleaseRequirementFixture = New-BinPathFixture
+try {
+  Set-SyntheticBinPathResponses $defaultReleaseRequirementFixture
+  [void](Invoke-SyntheticBinPathQuery $defaultReleaseRequirementFixture 'debug')
+  Assert-BinPathFailure { Invoke-SyntheticBinPathQuery $defaultReleaseRequirementFixture 'release' } `
+    'audit_show_bin_path_missing_release' 'binpath-missing-directory-requires-explicit-opt-in'
+} finally { Remove-BinPathFixture $defaultReleaseRequirementFixture }
+
+$entrypointText = [IO.File]::ReadAllText($entrypointPath)
+Assert-True ($entrypointText -match 'Get-VerifiedBinPath -Configuration ''debug''.*WorkspaceRoot \$env:GITHUB_WORKSPACE') 'debug-binpath-query-remains-required'
+Assert-True ($entrypointText -match 'Get-VerifiedBinPath -Configuration ''release''.*AllowMissingFinalDirectoryForComparison') 'release-missing-leaf-is-explicitly-scoped'
+Complete-Test 'production-debug-release-binpath-call-contract'
+
+$debugReleaseMissingFixture = New-BinPathFixture
+try {
+  $pair = Invoke-SyntheticBinPathPair $debugReleaseMissingFixture
+  Assert-True (Test-Path -LiteralPath $pair.Debug.path -PathType Container) 'debug-existing-path-accepted'
+  Assert-True (-not (Test-Path -LiteralPath $pair.Release.path)) 'release-final-directory-remains-missing'
+  Assert-Equal $pair.Debug.path $debugReleaseMissingFixture.DebugPath 'debug-returned-path-is-exact'
+  Assert-Equal $pair.Release.path $debugReleaseMissingFixture.ReleasePath 'release-returned-path-is-exact'
+  Complete-Test 'binpath-debug-exists-release-missing'
+} finally { Remove-BinPathFixture $debugReleaseMissingFixture }
+
+$bothBinPathsFixture = New-BinPathFixture
+try {
+  New-Item -ItemType Directory -Path $bothBinPathsFixture.ReleasePath -Force | Out-Null
+  $pair = Invoke-SyntheticBinPathPair $bothBinPathsFixture
+  Assert-True (Test-Path -LiteralPath $pair.Debug.path -PathType Container) 'debug-existing-path-validated'
+  Assert-True (Test-Path -LiteralPath $pair.Release.path -PathType Container) 'release-existing-path-validated'
+  Complete-Test 'binpath-debug-and-release-both-exist'
+} finally { Remove-BinPathFixture $bothBinPathsFixture }
+
+$distinctBinPathsFixture = New-BinPathFixture
+try {
+  $pair = Invoke-SyntheticBinPathPair $distinctBinPathsFixture
+  $buildPrefix = [IO.Path]::GetFullPath($distinctBinPathsFixture.BuildRoot).TrimEnd('\') + '\'
+  Assert-True ($pair.Debug.path.StartsWith($buildPrefix, [StringComparison]::OrdinalIgnoreCase)) 'debug-contained-by-build-root'
+  Assert-True ($pair.Release.path.StartsWith($buildPrefix, [StringComparison]::OrdinalIgnoreCase)) 'release-contained-by-build-root'
+  Assert-True (-not [string]::Equals($pair.Debug.path, $pair.Release.path, [StringComparison]::OrdinalIgnoreCase)) 'debug-release-are-distinct'
+  Complete-Test 'binpath-debug-release-distinct-under-build-root'
+  foreach ($configuration in @('debug', 'release')) {
+    $query = @($script:MockSwiftArguments[$configuration])
+    $configurationIndex = [Array]::IndexOf([string[]]$query, '-c')
+    Assert-True ($configurationIndex -ge 0 -and $query[$configurationIndex + 1] -ceq $configuration) "show-binpath-query-configuration-$configuration"
+    Assert-True ($query -contains '--build-tests' -and $query -contains '--show-bin-path' -and
+      $query -contains '-target' -and $query -contains 'x86_64-unknown-windows-msvc') "show-binpath-query-build-arguments-$configuration"
+  }
+  Complete-Test 'binpath-show-bin-path-query-retains-target-and-configuration-arguments'
+} finally { Remove-BinPathFixture $distinctBinPathsFixture }
+
+$debugMissingOptInFixture = New-BinPathFixture
+try {
+  Set-SyntheticBinPathResponses $debugMissingOptInFixture
+  Assert-BinPathFailure { Invoke-SyntheticBinPathQuery $debugMissingOptInFixture 'debug' -AllowMissingFinalDirectoryForComparison } `
+    'audit_missing_binpath_opt_in_invalid' 'binpath-missing-leaf-opt-in-rejected-for-debug'
+} finally { Remove-BinPathFixture $debugMissingOptInFixture }
+
+$missingDebugBinPathFixture = New-BinPathFixture
+try {
+  Remove-Item -LiteralPath $missingDebugBinPathFixture.DebugPath -Force
+  Set-SyntheticBinPathResponses $missingDebugBinPathFixture
+  Assert-BinPathFailure { Invoke-SyntheticBinPathQuery $missingDebugBinPathFixture 'debug' } `
+    'audit_show_bin_path_missing_debug' 'binpath-debug-missing-fails'
+} finally { Remove-BinPathFixture $missingDebugBinPathFixture }
+
+$outsideDebugBinPathFixture = New-BinPathFixture
+try {
+  Set-SyntheticBinPathResponses $outsideDebugBinPathFixture
+  $script:MockSwiftOutputs.debug = @($outsideDebugBinPathFixture.OutsidePath)
+  Assert-BinPathFailure { Invoke-SyntheticBinPathQuery $outsideDebugBinPathFixture 'debug' } `
+    'audit_show_bin_path_outside_build_root' 'binpath-debug-outside-build-root-fails'
+} finally { Remove-BinPathFixture $outsideDebugBinPathFixture }
+
+$outsideReleaseBinPathFixture = New-BinPathFixture
+try {
+  Set-SyntheticBinPathResponses $outsideReleaseBinPathFixture
+  $script:MockSwiftOutputs.release = @($outsideReleaseBinPathFixture.OutsidePath)
+  Assert-BinPathFailure { Invoke-SyntheticBinPathQuery $outsideReleaseBinPathFixture 'release' -AllowMissingFinalDirectoryForComparison } `
+    'audit_show_bin_path_outside_build_root' 'binpath-release-outside-build-root-fails'
+} finally { Remove-BinPathFixture $outsideReleaseBinPathFixture }
+
+$equalBinPathsFixture = New-BinPathFixture
+try {
+  Set-SyntheticBinPathResponses $equalBinPathsFixture
+  $script:MockSwiftOutputs.release = @($equalBinPathsFixture.DebugPath)
+  $debugBin = Invoke-SyntheticBinPathQuery $equalBinPathsFixture 'debug'
+  $releaseBin = Invoke-SyntheticBinPathQuery $equalBinPathsFixture 'release' -AllowMissingFinalDirectoryForComparison
+  Assert-BinPathFailure { . $script:ProductionBinPathPairGuard } `
+    'audit_debug_release_binpath_ambiguous' 'binpath-release-equals-debug-fails'
+} finally { Remove-BinPathFixture $equalBinPathsFixture }
+
+function New-SyntheticJunction([string]$Path, [string]$Target) {
+  try {
+    New-Item -ItemType Junction -Path $Path -Target $Target -ErrorAction Stop | Out-Null
+    return $true
+  } catch { return $false }
+}
+
+$aliasReleaseFixture = New-BinPathFixture
+try {
+  if (New-SyntheticJunction $aliasReleaseFixture.ReleasePath $aliasReleaseFixture.DebugPath) {
+    Set-SyntheticBinPathResponses $aliasReleaseFixture
+    Assert-BinPathFailure { Invoke-SyntheticBinPathQuery $aliasReleaseFixture 'release' -AllowMissingFinalDirectoryForComparison } `
+      'audit_build_path_reparse_point' 'binpath-release-aliases-debug-fails'
+  } else { Mark-NotTested 'binpath-release-aliases-debug-fails' 'junction_creation_unavailable' }
+} finally {
+  if (Test-Path -LiteralPath $aliasReleaseFixture.ReleasePath) { Remove-Item -LiteralPath $aliasReleaseFixture.ReleasePath -Force -ErrorAction SilentlyContinue }
+  Remove-BinPathFixture $aliasReleaseFixture
+}
+
+$reparseReleaseFixture = New-BinPathFixture
+try {
+  if (New-SyntheticJunction $reparseReleaseFixture.ReleasePath $reparseReleaseFixture.OutsidePath) {
+    Set-SyntheticBinPathResponses $reparseReleaseFixture
+    Assert-BinPathFailure { Invoke-SyntheticBinPathQuery $reparseReleaseFixture 'release' -AllowMissingFinalDirectoryForComparison } `
+      'audit_build_path_reparse_point' 'binpath-existing-release-reparse-point-fails'
+  } else { Mark-NotTested 'binpath-existing-release-reparse-point-fails' 'junction_creation_unavailable' }
+} finally {
+  if (Test-Path -LiteralPath $reparseReleaseFixture.ReleasePath) { Remove-Item -LiteralPath $reparseReleaseFixture.ReleasePath -Force -ErrorAction SilentlyContinue }
+  Remove-BinPathFixture $reparseReleaseFixture
+}
+
+$reparseAncestorFixture = New-BinPathFixture
+$ancestorJunction = Join-Path $reparseAncestorFixture.BuildRoot 'aliased-target'
+try {
+  if (New-SyntheticJunction $ancestorJunction $reparseAncestorFixture.OutsidePath) {
+    $script:MockSwiftOutputs = @{
+      debug = @([string]$reparseAncestorFixture.DebugPath)
+      release = @((Join-Path $ancestorJunction 'release'))
+    }
+    $script:MockSwiftExitCodes = @{ debug = 0; release = 0 }
+    $script:MockSwiftArguments = @{}
+    Assert-BinPathFailure { Invoke-SyntheticBinPathQuery $reparseAncestorFixture 'release' -AllowMissingFinalDirectoryForComparison } `
+      'audit_path_alias_not_allowed|audit_build_path_reparse_point' 'binpath-unsafe-existing-ancestor-fails'
+  } else { Mark-NotTested 'binpath-unsafe-existing-ancestor-fails' 'junction_creation_unavailable' }
+} finally {
+  if (Test-Path -LiteralPath $ancestorJunction) { Remove-Item -LiteralPath $ancestorJunction -Force -ErrorAction SilentlyContinue }
+  Remove-BinPathFixture $reparseAncestorFixture
+}
+
+$malformedBinPathFixture = New-BinPathFixture
+try {
+  Set-SyntheticBinPathResponses $malformedBinPathFixture
+  $script:MockSwiftOutputs.release = @('synthetic swift output without an absolute path')
+  Assert-BinPathFailure { Invoke-SyntheticBinPathQuery $malformedBinPathFixture 'release' -AllowMissingFinalDirectoryForComparison } `
+    'audit_show_bin_path_unrecognized_release' 'binpath-malformed-swift-output-fails'
+} finally { Remove-BinPathFixture $malformedBinPathFixture }
+
+$multipleBinPathsFixture = New-BinPathFixture
+try {
+  Set-SyntheticBinPathResponses $multipleBinPathsFixture
+  $script:MockSwiftOutputs.release = @($multipleBinPathsFixture.DebugPath, $multipleBinPathsFixture.ReleasePath)
+  Assert-BinPathFailure { Invoke-SyntheticBinPathQuery $multipleBinPathsFixture 'release' -AllowMissingFinalDirectoryForComparison } `
+    'audit_show_bin_path_unrecognized_release' 'binpath-multiple-swift-paths-fail'
+} finally { Remove-BinPathFixture $multipleBinPathsFixture }
+
+$traversalBinPathFixture = New-BinPathFixture
+try {
+  Set-SyntheticBinPathResponses $traversalBinPathFixture
+  $script:MockSwiftOutputs.release = @("$($traversalBinPathFixture.BuildRoot)\synthetic-target\..\traversal-release")
+  Assert-BinPathFailure { Invoke-SyntheticBinPathQuery $traversalBinPathFixture 'release' -AllowMissingFinalDirectoryForComparison } `
+    'audit_show_bin_path_traversal' 'binpath-release-dot-dot-segment-fails'
+} finally { Remove-BinPathFixture $traversalBinPathFixture }
+
+$missingReleaseParentFixture = New-BinPathFixture
+try {
+  Set-SyntheticBinPathResponses $missingReleaseParentFixture
+  $script:MockSwiftOutputs.release = @((Join-Path $missingReleaseParentFixture.BuildRoot 'unmaterialized-parent\release'))
+  Assert-BinPathFailure { Invoke-SyntheticBinPathQuery $missingReleaseParentFixture 'release' -AllowMissingFinalDirectoryForComparison } `
+    'audit_show_bin_path_parent_missing_release' 'binpath-missing-release-parent-fails'
+} finally { Remove-BinPathFixture $missingReleaseParentFixture }
+
+$failedSwiftQueryFixture = New-BinPathFixture
+try {
+  Set-SyntheticBinPathResponses $failedSwiftQueryFixture
+  $script:MockSwiftExitCodes.release = 23
+  Assert-BinPathFailure { Invoke-SyntheticBinPathQuery $failedSwiftQueryFixture 'release' -AllowMissingFinalDirectoryForComparison } `
+    'audit_show_bin_path_failed_release' 'binpath-swift-query-nonzero-fails'
+} finally { Remove-BinPathFixture $failedSwiftQueryFixture }
+
+$candidateRunnerMissingFixture = New-AuditFixture 'pass'
+try {
+  Remove-Item -LiteralPath $candidateRunnerMissingFixture.Candidates[0].path -Force
+  $report = Invoke-FixtureAudit $candidateRunnerMissingFixture
+  Assert-Equal $report.auditStatus 'FAIL' 'missing-runner-fails'
+  Assert-Equal $report.failureCategory 'candidate_path_invalid' 'missing-runner-category'
+  Complete-Test 'candidate-runner-missing-fails-closed'
+} finally { Remove-Item -LiteralPath $candidateRunnerMissingFixture.Root -Recurse -Force }
+
+$candidateModuleMissingFixture = New-AuditFixture 'pass'
+try {
+  Remove-Item -LiteralPath $candidateModuleMissingFixture.Candidates[1].path -Force
+  $report = Invoke-FixtureAudit $candidateModuleMissingFixture
+  Assert-Equal $report.auditStatus 'FAIL' 'missing-module-fails'
+  Assert-Equal $report.failureCategory 'candidate_path_invalid' 'missing-module-category'
+  Complete-Test 'candidate-test-module-missing-fails-closed'
+} finally { Remove-Item -LiteralPath $candidateModuleMissingFixture.Root -Recurse -Force }
+
+$candidateArchitectureFixture = New-AuditFixture 'pass'
+try {
+  $candidate = $candidateArchitectureFixture.Candidates[0]
+  $candidate.expectedSha256 = New-SyntheticPE $candidate.path -Machine 0x014c -Payload 'synthetic-x86-runner'
+  $report = Invoke-FixtureAudit $candidateArchitectureFixture
+  Assert-Equal $report.auditStatus 'FAIL' 'candidate-architecture-fails'
+  Assert-Equal $report.failureCategory 'candidate_architecture_mismatch' 'candidate-architecture-category'
+  Complete-Test 'candidate-pe-architecture-mismatch-fails-closed'
+} finally { Remove-Item -LiteralPath $candidateArchitectureFixture.Root -Recurse -Force }
+
+$invalidSourceCommitFixture = New-AuditFixture 'pass'
+try {
+  $invalidSourceCommitFixture.Identity.sourceCommit = 'not-a-source-commit'
+  $invalidSourceCommitFixture.Identity.requestedSourceCommit = 'not-a-source-commit'
+  $report = Invoke-FixtureAudit $invalidSourceCommitFixture
+  Assert-Equal $report.auditStatus 'FAIL' 'invalid-source-commit-fails'
+  Assert-Equal $report.failureCategory 'source_commit_mismatch' 'invalid-source-commit-category'
+  Complete-Test 'invalid-source-commit-fails-closed'
+} finally { Remove-Item -LiteralPath $invalidSourceCommitFixture.Root -Recurse -Force }
 
 $workflowPath = Join-Path $PSScriptRoot '..\..\..\workflows\windows.yml'
 $workflow = Get-Content -LiteralPath $workflowPath -Raw

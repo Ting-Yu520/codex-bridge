@@ -84,22 +84,45 @@ function Get-ArgumentListSha256([string[]]$Arguments) {
   } finally { $sha.Dispose() }
 }
 
-function Get-VerifiedBinPath([string]$Configuration, [string[]]$BaseArguments, [string]$SwiftExecutable, [string]$WorkspaceRoot) {
+function Get-VerifiedBinPath([string]$Configuration, [string[]]$BaseArguments, [string]$SwiftExecutable, [string]$WorkspaceRoot, [switch]$AllowMissingFinalDirectoryForComparison) {
+  if ($Configuration -cnotin @('debug', 'release')) { throw 'audit_show_bin_path_configuration_invalid' }
+  if ($AllowMissingFinalDirectoryForComparison -and $Configuration -cne 'release') {
+    throw 'audit_missing_binpath_opt_in_invalid'
+  }
   $queryArguments = @($BaseArguments) + @('-c', $Configuration, '--build-tests', '--show-bin-path')
   $queryOutput = @(& $SwiftExecutable build @queryArguments 2>&1)
   $queryExitCode = $LASTEXITCODE
   if ($queryExitCode -ne 0) { throw "audit_show_bin_path_failed_$Configuration" }
   $pathLines = @($queryOutput | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -match '^(?:[A-Za-z]:[\\/]|\\\\)' })
   if ($pathLines.Count -ne 1) { throw "audit_show_bin_path_unrecognized_$Configuration" }
+  if ([string]$pathLines[0] -match '(?:^|[\\/])\.\.(?:[\\/]|$)') { throw 'audit_show_bin_path_traversal' }
   $path = [IO.Path]::GetFullPath($pathLines[0])
   $buildRoot = [IO.Path]::GetFullPath((Join-Path $WorkspaceRoot 'Packages\BridgeCore\.build'))
   if (-not $path.StartsWith(($buildRoot.TrimEnd('\') + '\'), [StringComparison]::OrdinalIgnoreCase)) {
     throw 'audit_show_bin_path_outside_build_root'
   }
-  if (-not (Test-Path -LiteralPath $path -PathType Container)) { throw "audit_show_bin_path_missing_$Configuration" }
-  $resolvedPath = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $path -ErrorAction Stop).Path)
-  if (-not [string]::Equals($resolvedPath, $path, [StringComparison]::OrdinalIgnoreCase)) { throw 'audit_show_bin_path_alias_not_allowed' }
-  $current = $path
+  $leafItem = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+  $pathExists = $null -ne $leafItem
+  if ($pathExists) {
+    if (-not $leafItem.PSIsContainer) { throw "audit_show_bin_path_not_directory_$Configuration" }
+    if (($leafItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'audit_build_path_reparse_point' }
+    $resolvedPath = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $path -ErrorAction Stop).Path)
+    if (-not [string]::Equals($resolvedPath, $path, [StringComparison]::OrdinalIgnoreCase)) { throw 'audit_show_bin_path_alias_not_allowed' }
+    $current = $path
+  } else {
+    if (-not $AllowMissingFinalDirectoryForComparison) { throw "audit_show_bin_path_missing_$Configuration" }
+    $parentPath = [IO.Path]::GetFullPath((Split-Path -Parent $path))
+    $parentItem = Get-Item -LiteralPath $parentPath -Force -ErrorAction SilentlyContinue
+    if ($null -eq $parentItem -or -not $parentItem.PSIsContainer) { throw "audit_show_bin_path_parent_missing_$Configuration" }
+    $resolvedParent = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $parentPath -ErrorAction Stop).Path)
+    if (-not [string]::Equals($resolvedParent, $parentPath, [StringComparison]::OrdinalIgnoreCase)) { throw 'audit_show_bin_path_alias_not_allowed' }
+    $leafName = Split-Path -Leaf $path
+    $matchingEntries = @([IO.Directory]::EnumerateFileSystemEntries($parentPath) | Where-Object {
+      [string]::Equals([IO.Path]::GetFileName($_), $leafName, [StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($matchingEntries.Count -gt 0) { throw 'audit_show_bin_path_leaf_identity_unresolved' }
+    $current = $parentPath
+  }
   while ($current) {
     $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
     if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'audit_build_path_reparse_point' }
@@ -220,7 +243,7 @@ try {
   Push-Location (Join-Path $env:GITHUB_WORKSPACE 'Packages\BridgeCore')
   try {
     $debugBin = Get-VerifiedBinPath -Configuration 'debug' -BaseArguments $baseArguments -SwiftExecutable $swiftExe -WorkspaceRoot $env:GITHUB_WORKSPACE
-    $releaseBin = Get-VerifiedBinPath -Configuration 'release' -BaseArguments $baseArguments -SwiftExecutable $swiftExe -WorkspaceRoot $env:GITHUB_WORKSPACE
+    $releaseBin = Get-VerifiedBinPath -Configuration 'release' -BaseArguments $baseArguments -SwiftExecutable $swiftExe -WorkspaceRoot $env:GITHUB_WORKSPACE -AllowMissingFinalDirectoryForComparison
   } finally { Pop-Location }
   if ([string]::Equals($debugBin.path, $releaseBin.path, [StringComparison]::OrdinalIgnoreCase)) { throw 'audit_debug_release_binpath_ambiguous' }
   if ($env:MSVC_DUMPBIN_PATH -notmatch '\\bin\\Hostx64\\x64\\dumpbin\.exe$' -or

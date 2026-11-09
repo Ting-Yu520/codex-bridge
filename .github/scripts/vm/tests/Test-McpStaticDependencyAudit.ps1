@@ -422,14 +422,25 @@ $workflowPath = Join-Path $PSScriptRoot '..\..\..\workflows\windows.yml'
 $workflow = Get-Content -LiteralPath $workflowPath -Raw
 Assert-True ($workflow -match 'b1-dependency-audit-only') 'workflow-declares-audit-only-mode'
 Assert-True ($workflow -match '(?s)if:\s*inputs\.test_mode == ''b1-dependency-audit-only''.*?Invoke-McpStaticDependencyAudit\.ps1') 'workflow-audit-step-gated-to-audit-mode'
-Assert-True ($workflow -notmatch '(?s)if:\s*inputs\.test_mode == ''b1-dependency-audit-only''.*?uses:\s*actions/upload-artifact') 'workflow-audit-mode-does-not-upload-artifact'
-$compileIndex = $workflow.IndexOf('id: compile')
-$portableIndex = $workflow.IndexOf('id: prepare_portable')
-$auditIndex = $workflow.IndexOf('id: dependency_audit')
-Assert-True ($compileIndex -ge 0 -and $portableIndex -gt $compileIndex -and $auditIndex -gt $portableIndex) 'audit-runs-after-compile-and-portable-check'
-$auditEnd = $workflow.IndexOf('      - name: Report package inventory-only status', $auditIndex)
+$compileJobIndex = $workflow.IndexOf('  mcp-exe-compile-only:')
+Assert-True ($compileJobIndex -ge 0) 'compile-only-job-exists'
+$compileJobWorkflow = $workflow.Substring($compileJobIndex)
+$compileJobSteps = @([regex]::Matches($compileJobWorkflow, '(?ms)^      - (?:name|uses):.*?(?=^      - (?:name|uses):|\z)'))
+$auditModeSteps = @($compileJobSteps | Where-Object { $_.Value -match "inputs\.test_mode == 'b1-dependency-audit-only'" })
+$auditModeUploads = @($auditModeSteps | Where-Object { $_.Value -match 'uses:\s*actions/upload-artifact' })
+Assert-True ($auditModeUploads.Count -eq 0) 'workflow-audit-mode-does-not-upload-artifact'
+$boundaryIndex = $compileJobWorkflow.IndexOf('Verify compile-only dispatch boundary')
+$portableIndex = $compileJobWorkflow.IndexOf('id: prepare_portable')
+$swiftSetupIndex = $compileJobWorkflow.IndexOf('Install Swift toolchain')
+$compileIndex = $compileJobWorkflow.IndexOf('Compile Swift sources and XCTest targets without running them')
+$auditIndex = $compileJobWorkflow.IndexOf('Run static PE dependency audit without executing binaries')
+Assert-True ($boundaryIndex -ge 0 -and $portableIndex -gt $boundaryIndex -and
+  $swiftSetupIndex -gt $portableIndex -and $compileIndex -gt $swiftSetupIndex -and
+  $auditIndex -gt $compileIndex) 'audit-runs-after-portable-then-compile'
+$auditWorkflowIndex = $compileJobIndex + $auditIndex
+$auditEnd = $workflow.IndexOf('      - name: Report package inventory-only status', $auditWorkflowIndex)
 if ($auditEnd -lt 0) { throw 'assertion_failed_audit_workflow_boundary_missing' }
-$auditWorkflowSection = $workflow.Substring($auditIndex, $auditEnd - $auditIndex)
+$auditWorkflowSection = $workflow.Substring($auditWorkflowIndex, $auditEnd - $auditWorkflowIndex)
 Assert-True ($auditWorkflowSection -match "if: success\(\) && inputs\.test_mode == 'b1-dependency-audit-only'") 'audit-step-success-gated-and-mode-specific'
 Assert-True ($auditWorkflowSection -notmatch 'swift\s+test|Start-Process|Invoke-McpVmGuestHarness|actions/upload-artifact') 'audit-step-never-runs-tests-service-vm-or-upload'
 Assert-True ($workflow -notmatch '6c4d86c0cec892f69c27749f81690ed4b70d89d3') 'workflow-does-not-hardcode-parent-as-permitted-audit-sha'

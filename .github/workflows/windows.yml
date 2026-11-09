@@ -804,6 +804,13 @@ jobs:
           }
           "source_commit=$($head.ToLowerInvariant())" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
           Write-Output "PASS test=compile-only-dispatch architecture=x64 commit=$head"
+      - name: Download and verify approved Portable source for static audit
+        id: prepare_portable
+        if: inputs.test_mode == 'b1-dependency-audit-only'
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: '& "$env:GITHUB_WORKSPACE\.github\scripts\prepare-mcp-process-artifact.ps1"'
       - name: Install Swift toolchain
         shell: pwsh
         run: '& "$env:GITHUB_WORKSPACE\.github\scripts\setup-windows-swift.ps1" -Version $env:SWIFT_VERSION'
@@ -1080,13 +1087,6 @@ jobs:
             ${{ runner.temp }}/b1-package-inventory/SHA256SUMS.txt.sha256
           if-no-files-found: error
           retention-days: 1
-      - name: Download and verify approved Portable source for static audit
-        id: prepare_portable
-        if: inputs.test_mode == 'b1-dependency-audit-only'
-        shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: '& "$env:GITHUB_WORKSPACE\.github\scripts\prepare-mcp-process-artifact.ps1"'
       - name: Run static PE dependency audit without executing binaries
         id: dependency_audit
         if: success() && inputs.test_mode == 'b1-dependency-audit-only'

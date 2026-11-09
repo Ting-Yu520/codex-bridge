@@ -10,20 +10,39 @@ $expectedPortableZipDigest = "3e0b733f7c91602e1a18b3f3baf887e1ef22d28cdfeaea9f20
 $expectedServiceDigest = "428b39d31c1e57adc0609720d450fa7bd3c56295289a1f46b1863dab69a72521"
 $apiRoot = "https://api.github.com/repos/Ting-Yu520/codex-bridge"
 $artifactName = "codex-bridge-windows-x64"
+$script:ArtifactPreparationHttpStatus = "UNAVAILABLE"
+$script:ArtifactPreparationHttpHop = "UNKNOWN"
+$script:ArtifactPreparationMockHttpEnabled = $false
+$script:ArtifactPreparationMockHttpHandler = $null
 
 function Get-Sha256([string]$Path) {
   return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
 function Download-ArtifactZip([string]$Uri, [string]$Destination) {
-  $handler = [System.Net.Http.HttpClientHandler]::new()
-  $handler.AllowAutoRedirect = $false
+  $script:ArtifactPreparationHttpStatus = "UNAVAILABLE"
+  $script:ArtifactPreparationHttpHop = "UNKNOWN"
+  if ($script:ArtifactPreparationMockHttpEnabled) {
+    $handler = $script:ArtifactPreparationMockHttpHandler
+    if ($null -eq $handler) { throw "artifact_mock_http_handler_missing" }
+  } else {
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.AllowAutoRedirect = $false
+  }
   $client = [System.Net.Http.HttpClient]::new($handler)
   $client.Timeout = [TimeSpan]::FromMinutes(10)
   try {
     $current = [Uri]::new($Uri)
     for ($redirect = 0; $redirect -le 5; $redirect++) {
       if ($current.Scheme -ne "https") { throw "artifact_download_non_https" }
+      $requestHop = if ($redirect -eq 0 -and $current.Host -eq "api.github.com") {
+        "API"
+      } elseif ($redirect -gt 0) {
+        "REDIRECTED"
+      } else {
+        "UNKNOWN"
+      }
+      $script:ArtifactPreparationHttpHop = $requestHop
       $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $current)
       [void]$request.Headers.Accept.Add([System.Net.Http.Headers.MediaTypeWithQualityHeaderValue]::new("application/octet-stream"))
       if ($current.Host -eq "api.github.com") {
@@ -38,15 +57,21 @@ function Download-ArtifactZip([string]$Uri, [string]$Destination) {
         if ([int]$response.StatusCode -in @(301, 302, 303, 307, 308)) {
           if (-not $response.Headers.Location) { throw "artifact_redirect_location_missing" }
           $next = [Uri]::new($current, $response.Headers.Location)
-          $host = $next.Host.ToLowerInvariant()
-          $allowedHost = $host -eq "api.github.com" -or $host -eq "github.com" -or
-            $host.EndsWith(".githubusercontent.com") -or $host.EndsWith(".blob.core.windows.net") -or
-            $host.EndsWith(".actions.githubusercontent.com")
+          $redirectHost = $next.Host.ToLowerInvariant()
+          $allowedHost = $redirectHost -eq "api.github.com" -or $redirectHost -eq "github.com" -or
+            $redirectHost.EndsWith(".githubusercontent.com") -or $redirectHost.EndsWith(".blob.core.windows.net") -or
+            $redirectHost.EndsWith(".actions.githubusercontent.com")
           if ($next.Scheme -ne "https" -or -not $allowedHost) { throw "artifact_redirect_host_not_allowed" }
           $current = $next
           continue
         }
-        if (-not $response.IsSuccessStatusCode) { throw "artifact_download_http_failure" }
+        if (-not $response.IsSuccessStatusCode) {
+          $statusCode = [int]$response.StatusCode
+          if ($statusCode -ge 100 -and $statusCode -le 599) {
+            $script:ArtifactPreparationHttpStatus = [string]$statusCode
+          }
+          throw "artifact_download_http_failure"
+        }
         $source = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
         $destinationStream = [IO.File]::Create($Destination)
         try { $source.CopyTo($destinationStream) } finally { $destinationStream.Dispose(); $source.Dispose() }
@@ -204,18 +229,22 @@ function Get-SafeArtifactPreparationFailureKind(
   }
 
   if ($knownKinds.ContainsKey($message)) { return $knownKinds[$message] }
-  $exceptionType = $ErrorRecord.Exception.GetType().FullName
-  if ($Stage -in @("RUN_METADATA", "ARTIFACT_LIST") -and
-      $exceptionType -in @(
-        "Microsoft.PowerShell.Commands.HttpResponseException",
-        "System.Net.Http.HttpRequestException",
-        "System.Net.WebException"
-      )) {
-    return "GITHUB_API_REQUEST_FAILED"
-  }
-  if ($Stage -eq "ARTIFACT_DOWNLOAD" -and
-      $exceptionType -in @("System.Net.Http.HttpRequestException", "System.Net.WebException")) {
-    return "ARTIFACT_DOWNLOAD_FAILED"
+  $exception = $ErrorRecord.Exception
+  while ($null -ne $exception) {
+    $exceptionType = $exception.GetType().FullName
+    if ($Stage -in @("RUN_METADATA", "ARTIFACT_LIST") -and
+        $exceptionType -in @(
+          "Microsoft.PowerShell.Commands.HttpResponseException",
+          "System.Net.Http.HttpRequestException",
+          "System.Net.WebException"
+        )) {
+      return "GITHUB_API_REQUEST_FAILED"
+    }
+    if ($Stage -eq "ARTIFACT_DOWNLOAD" -and
+        $exceptionType -in @("System.Net.Http.HttpRequestException", "System.Net.WebException")) {
+      return "ARTIFACT_DOWNLOAD_FAILED"
+    }
+    $exception = $exception.InnerException
   }
   return "UNKNOWN"
 }
@@ -229,6 +258,18 @@ function Write-ArtifactPreparationFailure(
   Write-Output "ERROR_CATEGORY=candidate_artifact_preparation_failed"
   Write-Output "ARTIFACT_PREP_FAILED_STAGE=$safeStage"
   Write-Output "ARTIFACT_PREP_FAILURE_KIND=$safeKind"
+  if ($safeStage -eq "ARTIFACT_DOWNLOAD") {
+    $safeHttpStatus = "UNAVAILABLE"
+    $candidateHttpStatus = [string]$script:ArtifactPreparationHttpStatus
+    if ($candidateHttpStatus -match '^[1-5][0-9]{2}$') { $safeHttpStatus = $candidateHttpStatus }
+    $safeHttpHop = if ($script:ArtifactPreparationHttpHop -in @("API", "REDIRECTED", "UNKNOWN")) {
+      [string]$script:ArtifactPreparationHttpHop
+    } else {
+      "UNKNOWN"
+    }
+    Write-Output "ARTIFACT_PREP_HTTP_STATUS=$safeHttpStatus"
+    Write-Output "ARTIFACT_PREP_HTTP_HOP=$safeHttpHop"
+  }
   $script:ArtifactPreparationExitCode = 1
 }
 
@@ -246,7 +287,11 @@ function Write-PreparedArtifactEnvironment(
   Add-Content -LiteralPath $GitHubEnvPath -Value "CODEX_BRIDGE_ARTIFACT_VERIFICATION=PASS"
 }
 
-if ($MyInvocation.InvocationName -eq ".") { return }
+if ($MyInvocation.InvocationName -eq ".") {
+  $script:ArtifactPreparationMockHttpEnabled = $true
+  return
+}
+$script:ArtifactPreparationMockHttpEnabled = $false
 
 $currentStage = "PRECONDITION"
 try {

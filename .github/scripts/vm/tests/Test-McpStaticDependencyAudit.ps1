@@ -460,6 +460,168 @@ foreach ($outputKey in @('audit_status', 'source_commit', 'harness_graph_status'
   Assert-True ($wrapper.Contains("$outputKey =")) "wrapper-derives-summary-output-$outputKey"
 }
 Assert-True ($wrapper -match 'Add-Content\s+-LiteralPath\s+\$env:GITHUB_OUTPUT') 'wrapper-persists-audit-step-outputs'
+
+function ConvertTo-PowerShellLiteral([string]$Value) {
+  return "'" + $Value.Replace("'", "''") + "'"
+}
+
+function Get-StaticAuditSummaryScript([string]$WorkflowText) {
+  $stepPattern = '(?ms)^      - name: Report static dependency audit status without packaging or execution\r?\n(?<step>.*?)(?=^      - (?:name|uses):|\z)'
+  $stepMatch = [regex]::Match($WorkflowText, $stepPattern)
+  if (-not $stepMatch.Success) { throw 'summary_step_missing' }
+  $stepText = $stepMatch.Groups['step'].Value
+  $runMatch = [regex]::Match($stepText, '(?m)^        run:\s*\|\r?\n')
+  if (-not $runMatch.Success) { throw 'summary_run_block_missing' }
+  $body = $stepText.Substring($runMatch.Index + $runMatch.Length)
+  $scriptLines = foreach ($line in ($body -split '\r?\n')) {
+    if ([string]::IsNullOrWhiteSpace($line)) {
+      ''
+    } elseif ($line.StartsWith('          ', [StringComparison]::Ordinal)) {
+      $line.Substring(10)
+    } else {
+      throw 'summary_run_indentation_unexpected'
+    }
+  }
+  return ($scriptLines -join [Environment]::NewLine)
+}
+
+$summaryRunScript = Get-StaticAuditSummaryScript $workflow
+$summaryTestRoot = Join-Path $env:TEMP ('codex-bridge-audit-summary-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $summaryTestRoot -Force | Out-Null
+$summaryDefaults = @{
+  COMPILE_OUTCOME = 'success'
+  COMPILE_STATUS = 'PASS'
+  VERIFIED_SOURCE_COMMIT = ('a' * 40)
+  PORTABLE_OUTCOME = 'success'
+  AUDIT_OUTCOME = 'success'
+  AUDIT_STATUS = 'PASS'
+  AUDIT_SOURCE_COMMIT = ('a' * 40)
+  HARNESS_GRAPH_STATUS = 'PASS'
+  PORTABLE_GRAPH_STATUS = 'PASS'
+  RUNNER_BUILD_ASSOCIATION = 'PASS'
+  DEPENDENCY_NODE_COUNT = '12'
+  IMPORT_EDGE_COUNT = '11'
+  DELAY_IMPORT_EDGE_COUNT = '1'
+  UNRESOLVED_COUNT = '0'
+  SOURCE_COLLISION_COUNT = '0'
+  REPORT_SHA256 = ('b' * 64)
+}
+$summaryEnvironmentKeys = @($summaryDefaults.Keys) + @('GITHUB_STEP_SUMMARY')
+$pwshPath = (Get-Command pwsh -ErrorAction Stop).Source
+
+function Invoke-StaticAuditSummaryFixture([string]$Name, [hashtable]$Overrides = @{}) {
+  $fixtureDirectory = Join-Path $summaryTestRoot $Name
+  New-Item -ItemType Directory -Path $fixtureDirectory -Force | Out-Null
+  $summaryPath = Join-Path $fixtureDirectory 'summary.txt'
+  $scriptPath = Join-Path $fixtureDirectory 'summary.ps1'
+  $bootstrap = [Collections.Generic.List[string]]::new()
+  $bootstrap.Add('$ErrorActionPreference = ''Stop''')
+  foreach ($key in $summaryEnvironmentKeys) {
+    if ($key -ceq 'GITHUB_STEP_SUMMARY') {
+      $value = $summaryPath
+    } elseif ($Overrides.ContainsKey($key)) {
+      $value = $Overrides[$key]
+    } else {
+      $value = $summaryDefaults[$key]
+    }
+    if ($null -eq $value) {
+      $bootstrap.Add("Remove-Item -LiteralPath 'Env:$key' -ErrorAction SilentlyContinue")
+    } else {
+      $bootstrap.Add('$env:' + $key + ' = ' + (ConvertTo-PowerShellLiteral ([string]$value)))
+    }
+  }
+  $scriptText = (@($bootstrap) + @($summaryRunScript)) -join [Environment]::NewLine
+  [IO.File]::WriteAllText($scriptPath, $scriptText, [Text.UTF8Encoding]::new($false))
+
+  $startInfo = [Diagnostics.ProcessStartInfo]::new()
+  $startInfo.FileName = $pwshPath
+  foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $scriptPath)) {
+    $startInfo.ArgumentList.Add($argument)
+  }
+  $startInfo.UseShellExecute = $false
+  $startInfo.RedirectStandardOutput = $true
+  $startInfo.RedirectStandardError = $true
+  $child = [Diagnostics.Process]::Start($startInfo)
+  if ($null -eq $child) { throw 'summary_fixture_process_start_failed' }
+  $stdout = $child.StandardOutput.ReadToEnd()
+  $stderr = $child.StandardError.ReadToEnd()
+  if (-not $child.WaitForExit(20000)) {
+    $child.Kill()
+    [void]$child.WaitForExit(5000)
+    throw 'summary_fixture_process_timeout'
+  }
+  $summaryText = if (Test-Path -LiteralPath $summaryPath -PathType Leaf) {
+    Get-Content -LiteralPath $summaryPath -Raw
+  } else {
+    ''
+  }
+  return [pscustomobject]@{
+    ExitCode = $child.ExitCode
+    Summary = $summaryText
+    Output = $stdout + $stderr
+  }
+}
+
+function Assert-SummaryFixture([pscustomobject]$Fixture, [int]$ExpectedExit, [string[]]$ExpectedLines, [string]$Name) {
+  Assert-True ($Fixture.ExitCode -eq $ExpectedExit) "$Name-exit-code"
+  foreach ($line in $ExpectedLines) {
+    Assert-True ($Fixture.Summary.Contains($line)) "$Name-$($line.Replace('=', '-'))"
+  }
+}
+
+try {
+  $portableFailure = Invoke-StaticAuditSummaryFixture 'portable-failure' @{
+    PORTABLE_OUTCOME = 'failure'; COMPILE_OUTCOME = 'skipped'; COMPILE_STATUS = $null
+    AUDIT_OUTCOME = 'skipped'; AUDIT_STATUS = $null
+  }
+  Assert-SummaryFixture $portableFailure 1 @('PORTABLE_SOURCE_STATUS=FAIL', 'COMPILE_STATUS=NOT_RUN', 'STATIC_IMPORT_AUDIT=NOT_RUN') 'portable-failure-before-compile'
+  Complete-Test 'summary-portable-failure-before-compilation'
+
+  $compileFailure = Invoke-StaticAuditSummaryFixture 'compile-failure' @{
+    PORTABLE_OUTCOME = 'success'; COMPILE_OUTCOME = 'failure'; COMPILE_STATUS = 'FAIL'
+    AUDIT_OUTCOME = 'skipped'; AUDIT_STATUS = $null
+  }
+  Assert-SummaryFixture $compileFailure 1 @('PORTABLE_SOURCE_STATUS=PASS', 'COMPILE_STATUS=FAIL', 'STATIC_IMPORT_AUDIT=NOT_RUN') 'portable-success-compile-failure'
+  Complete-Test 'summary-portable-success-and-compile-failure'
+
+  $auditIncomplete = Invoke-StaticAuditSummaryFixture 'audit-incomplete' @{
+    PORTABLE_OUTCOME = 'success'; COMPILE_OUTCOME = 'success'; COMPILE_STATUS = 'PASS'
+    AUDIT_OUTCOME = 'failure'; AUDIT_STATUS = 'INCOMPLETE'
+  }
+  Assert-SummaryFixture $auditIncomplete 1 @('PORTABLE_SOURCE_STATUS=PASS', 'COMPILE_STATUS=PASS', 'STATIC_IMPORT_AUDIT=INCOMPLETE') 'successful-compile-audit-incomplete'
+  Complete-Test 'summary-compile-pass-audit-incomplete'
+
+  $allSuccessful = Invoke-StaticAuditSummaryFixture 'all-successful' @{}
+  Assert-SummaryFixture $allSuccessful 0 @('PORTABLE_SOURCE_STATUS=PASS', 'COMPILE_STATUS=PASS', 'STATIC_IMPORT_AUDIT=PASS') 'all-steps-successful'
+  Complete-Test 'summary-all-steps-successful'
+
+  $portableSkipped = Invoke-StaticAuditSummaryFixture 'portable-skipped' @{
+    PORTABLE_OUTCOME = 'skipped'; COMPILE_OUTCOME = 'success'; COMPILE_STATUS = 'PASS'
+    AUDIT_OUTCOME = 'skipped'; AUDIT_STATUS = 'PASS'
+  }
+  Assert-SummaryFixture $portableSkipped 1 @('PORTABLE_SOURCE_STATUS=NOT_RUN', 'COMPILE_STATUS=PASS', 'STATIC_IMPORT_AUDIT=NOT_RUN') 'portable-skipped'
+  Complete-Test 'summary-portable-step-skipped'
+
+  $unknownStatuses = Invoke-StaticAuditSummaryFixture 'unknown-statuses' @{
+    PORTABLE_OUTCOME = 'unknown'; COMPILE_OUTCOME = 'success'; COMPILE_STATUS = $null
+    AUDIT_OUTCOME = 'success'; AUDIT_STATUS = 'UNEXPECTED'
+  }
+  Assert-SummaryFixture $unknownStatuses 1 @('PORTABLE_SOURCE_STATUS=FAIL', 'COMPILE_STATUS=FAIL', 'STATIC_IMPORT_AUDIT=FAIL') 'unknown-and-missing-statuses'
+  Assert-True (-not $unknownStatuses.Summary.Contains('PORTABLE_SOURCE_STATUS=PASS')) 'unknown-portable-outcome-cannot-pass'
+  Assert-True (-not $unknownStatuses.Summary.Contains('COMPILE_STATUS=PASS')) 'missing-compile-status-cannot-pass'
+  $missingStatuses = Invoke-StaticAuditSummaryFixture 'missing-statuses' @{
+    PORTABLE_OUTCOME = $null; COMPILE_OUTCOME = 'success'; COMPILE_STATUS = 'INVALID'
+    AUDIT_OUTCOME = 'success'; AUDIT_STATUS = $null
+  }
+  Assert-SummaryFixture $missingStatuses 1 @('PORTABLE_SOURCE_STATUS=FAIL', 'COMPILE_STATUS=FAIL', 'STATIC_IMPORT_AUDIT=FAIL') 'missing-and-invalid-statuses'
+  Assert-True (-not $missingStatuses.Summary.Contains('COMPILE_STATUS=PASS')) 'invalid-compile-status-cannot-pass'
+  Complete-Test 'summary-unknown-or-missing-status-fails-closed'
+} finally {
+  if (Test-Path -LiteralPath $summaryTestRoot -PathType Container) {
+    Remove-Item -LiteralPath $summaryTestRoot -Recurse -Force
+  }
+}
+
 Complete-Test 'workflow-audit-mode-has-no-runtime-or-artifact-upload'
 
 Write-Output "TEST_SUMMARY executed=$script:passed failures=0"

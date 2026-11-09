@@ -1173,10 +1173,30 @@ jobs:
           SOURCE_COLLISION_COUNT: ${{ steps.dependency_audit.outputs.source_collision_count }}
           REPORT_SHA256: ${{ steps.dependency_audit.outputs.report_sha256 }}
         run: |
-          $compilePass = $env:COMPILE_OUTCOME -ceq 'success' -and $env:COMPILE_STATUS -ceq 'PASS'
-          $portablePass = $env:PORTABLE_OUTCOME -ceq 'success'
-          $auditPass = $env:AUDIT_OUTCOME -ceq 'success' -and $env:AUDIT_STATUS -ceq 'PASS'
-          $auditStatus = if ($env:AUDIT_STATUS -cin @('PASS', 'INCOMPLETE', 'FAIL')) { $env:AUDIT_STATUS } else { 'NOT_RUN' }
+          $compileStatus = 'FAIL'
+          if ($env:COMPILE_OUTCOME -ceq 'skipped') {
+            $compileStatus = 'NOT_RUN'
+          } elseif ($env:COMPILE_OUTCOME -ceq 'success' -and $env:COMPILE_STATUS -ceq 'PASS') {
+            $compileStatus = 'PASS'
+          }
+          $portableSourceStatus = 'FAIL'
+          if ($env:PORTABLE_OUTCOME -ceq 'success') {
+            $portableSourceStatus = 'PASS'
+          } elseif ($env:PORTABLE_OUTCOME -ceq 'skipped') {
+            $portableSourceStatus = 'NOT_RUN'
+          }
+          $auditOutcome = if ($env:AUDIT_OUTCOME -cin @('success', 'failure', 'skipped', 'cancelled')) { $env:AUDIT_OUTCOME } else { 'unknown' }
+          $auditStatus = 'FAIL'
+          if ($env:AUDIT_OUTCOME -cin @('skipped', 'cancelled')) {
+            $auditStatus = 'NOT_RUN'
+          } elseif ($env:AUDIT_OUTCOME -ceq 'failure' -and $env:AUDIT_STATUS -cin @('INCOMPLETE', 'FAIL')) {
+            $auditStatus = $env:AUDIT_STATUS
+          } elseif ($env:AUDIT_OUTCOME -ceq 'success' -and $env:AUDIT_STATUS -cin @('PASS', 'INCOMPLETE', 'FAIL')) {
+            $auditStatus = $env:AUDIT_STATUS
+          }
+          $compilePass = $compileStatus -ceq 'PASS'
+          $portablePass = $portableSourceStatus -ceq 'PASS'
+          $auditPass = $env:AUDIT_OUTCOME -ceq 'success' -and $auditStatus -ceq 'PASS'
           $sourceCommit = if ($env:VERIFIED_SOURCE_COMMIT -match '^[0-9a-f]{40}$') { $env:VERIFIED_SOURCE_COMMIT } else { 'UNVERIFIED' }
           if ($env:AUDIT_SOURCE_COMMIT -match '^[0-9a-f]{40}$' -and $env:AUDIT_SOURCE_COMMIT -cne $sourceCommit) { throw 'audit_summary_source_commit_mismatch' }
           $harnessStatus = if ($env:HARNESS_GRAPH_STATUS -cin @('PASS', 'INCOMPLETE', 'FAIL', 'NOT_RUN')) { $env:HARNESS_GRAPH_STATUS } else { 'NOT_RUN' }
@@ -1188,9 +1208,6 @@ jobs:
           $unresolvedCount = if ($env:UNRESOLVED_COUNT -match '^[0-9]+$') { $env:UNRESOLVED_COUNT } else { '0' }
           $collisionCount = if ($env:SOURCE_COLLISION_COUNT -match '^[0-9]+$') { $env:SOURCE_COLLISION_COUNT } else { '0' }
           $reportSha = if ($env:REPORT_SHA256 -match '^[0-9a-f]{64}$') { $env:REPORT_SHA256 } else { 'NOT_CREATED' }
-          $compileStatus = if ($compilePass) { 'PASS' } else { 'FAIL_OR_NOT_RUN' }
-          $portableSourceStatus = if ($portablePass) { 'PASS' } elseif ($compilePass) { 'FAIL' } else { 'NOT_RUN' }
-          $auditOutcome = if ($env:AUDIT_OUTCOME) { $env:AUDIT_OUTCOME } else { 'NOT_RUN' }
           $summary = @(
             '```text',
             "COMPILE_STATUS=$compileStatus",

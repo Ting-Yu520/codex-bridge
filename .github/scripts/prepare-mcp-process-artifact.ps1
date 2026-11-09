@@ -44,11 +44,13 @@ function Download-ArtifactZip([string]$Uri, [string]$Destination) {
       }
       $script:ArtifactPreparationHttpHop = $requestHop
       $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $current)
-      [void]$request.Headers.Accept.Add([System.Net.Http.Headers.MediaTypeWithQualityHeaderValue]::new("application/octet-stream"))
       if ($current.Host -eq "api.github.com") {
+        [void]$request.Headers.Accept.Add([System.Net.Http.Headers.MediaTypeWithQualityHeaderValue]::new("application/vnd.github+json"))
         [void]$request.Headers.UserAgent.ParseAdd("codex-bridge-b1-artifact-verifier/1.0")
         $request.Headers.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new("Bearer", $env:GITHUB_TOKEN)
         [void]$request.Headers.TryAddWithoutValidation("X-GitHub-Api-Version", "2022-11-28")
+      } else {
+        [void]$request.Headers.Accept.Add([System.Net.Http.Headers.MediaTypeWithQualityHeaderValue]::new("application/octet-stream"))
       }
       $response = $client.SendAsync(
         $request,

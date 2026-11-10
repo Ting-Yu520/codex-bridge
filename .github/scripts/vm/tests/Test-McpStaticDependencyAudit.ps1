@@ -10,16 +10,16 @@ $entrypointTokens = $null
 $entrypointParseErrors = $null
 $entrypointAst = [System.Management.Automation.Language.Parser]::ParseFile($entrypointPath, [ref]$entrypointTokens, [ref]$entrypointParseErrors)
 if ($entrypointParseErrors.Count -gt 0) { throw 'assertion_failed_audit_entrypoint_ast_parse' }
-$pathFunctionNames = @('Get-ArgumentListSha256', 'Get-VerifiedBinPath')
-$pathFunctionAsts = @($entrypointAst.FindAll({
+$productionFunctionNames = @('Get-ArgumentListSha256', 'Get-VerifiedBinPath', 'ConvertTo-SanitizedAuditFailureCategory', 'Get-SanitizedAuditResultClassification')
+$productionFunctionAsts = @($entrypointAst.FindAll({
   param($node)
-  $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $pathFunctionNames -contains $node.Name
+  $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $productionFunctionNames -contains $node.Name
 }, $true))
-if (@($pathFunctionAsts.Name | Select-Object -Unique).Count -ne $pathFunctionNames.Count) {
-  throw 'assertion_failed_production_binpath_functions_missing'
+if (@($productionFunctionAsts.Name | Select-Object -Unique).Count -ne $productionFunctionNames.Count) {
+  throw 'assertion_failed_production_audit_functions_missing'
 }
-foreach ($pathFunctionAst in $pathFunctionAsts) {
-  . ([scriptblock]::Create($pathFunctionAst.Extent.Text))
+foreach ($productionFunctionAst in $productionFunctionAsts) {
+  . ([scriptblock]::Create($productionFunctionAst.Extent.Text))
 }
 $binPathPairGuardAst = @($entrypointAst.FindAll({
   param($node)
@@ -959,5 +959,80 @@ try {
 }
 
 Complete-Test 'workflow-audit-mode-has-no-runtime-or-artifact-upload'
+
+$existingAuditTestCount = $script:passed
+if ($existingAuditTestCount -ne 46) { throw 'assertion_failed_existing_static_audit_test_baseline_changed' }
+$script:failureCategoryTestsPassed = 0
+function Complete-FailureCategoryTest([string]$Name) {
+  $script:failureCategoryTestsPassed++
+  Complete-Test $Name
+}
+
+$untrustedFailureCategory = 'C:' + [char]92 + 'Synthetic' + [char]92 + 'Private category'
+$syntheticToken = 'synthetic-' + 'not-a-real-token'
+$syntheticBearer = 'Bea' + 'rer ' + $syntheticToken
+$rawDiagnosticJson = ConvertTo-Json -InputObject ([ordered]@{
+  authorization = $syntheticBearer
+  path = $untrustedFailureCategory
+  response = 'synthetic-body-sentinel'
+}) -Compress
+$classificationCases = @(
+  [pscustomobject]@{ name = 'candidate-identity-failure-keeps-module-category'; report = [pscustomobject]@{ auditStatus = 'FAIL'; failureCategory = 'candidate_sha256_mismatch'; dependencyNodeCount = 0; unresolvedCount = 0; unresolvedDependencies = @() }; status = 'FAIL'; category = 'audit_candidate_sha256_mismatch' }
+  [pscustomobject]@{ name = 'dumpbin-unavailable-keeps-module-category'; report = [pscustomobject]@{ auditStatus = 'FAIL'; failureCategory = 'dumpbin_unavailable'; dependencyNodeCount = 0; unresolvedCount = 0; unresolvedDependencies = @() }; status = 'FAIL'; category = 'audit_dumpbin_unavailable' }
+  [pscustomobject]@{ name = 'malformed-dumpbin-output-keeps-module-category'; report = [pscustomobject]@{ auditStatus = 'FAIL'; failureCategory = 'dumpbin_format_unrecognized'; dependencyNodeCount = 0; unresolvedCount = 0; unresolvedDependencies = @() }; status = 'FAIL'; category = 'audit_dumpbin_format_unrecognized' }
+  [pscustomobject]@{ name = 'dependency-cycle-keeps-module-category'; report = [pscustomobject]@{ auditStatus = 'FAIL'; failureCategory = 'dependency_cycle'; dependencyNodeCount = 2; unresolvedCount = 0; unresolvedDependencies = @() }; status = 'FAIL'; category = 'audit_dependency_cycle' }
+  [pscustomobject]@{ name = 'internal-failure-keeps-module-category'; report = [pscustomobject]@{ auditStatus = 'FAIL'; failureCategory = 'internal_audit_failure'; dependencyNodeCount = 0; unresolvedCount = 0; unresolvedDependencies = @() }; status = 'FAIL'; category = 'audit_internal_audit_failure' }
+  [pscustomobject]@{ name = 'missing-category-has-distinct-marker'; report = [pscustomobject]@{ auditStatus = 'FAIL'; failureCategory = $null; dependencyNodeCount = 3; unresolvedCount = 0; unresolvedDependencies = @() }; status = 'FAIL'; category = 'audit_failure_category_unavailable' }
+  [pscustomobject]@{ name = 'malformed-untrusted-category-is-replaced'; report = [pscustomobject]@{ auditStatus = 'FAIL'; failureCategory = $untrustedFailureCategory; absolutePath = $untrustedFailureCategory; rawException = 'synthetic exception details'; rawDiagnosticJson = $rawDiagnosticJson; dependencyNodeCount = 0; unresolvedCount = 0; unresolvedDependencies = @() }; status = 'FAIL'; category = 'audit_failure_category_unavailable' }
+  [pscustomobject]@{ name = 'unlisted-ascii-category-is-rejected'; report = [pscustomobject]@{ auditStatus = 'FAIL'; failureCategory = 'unlisted_private_reason'; dependencyNodeCount = 0; unresolvedCount = 0; unresolvedDependencies = @() }; status = 'FAIL'; category = 'audit_failure_category_unavailable' }
+  [pscustomobject]@{ name = 'incomplete-with-verified-unresolved-dependencies'; report = [pscustomobject]@{ auditStatus = 'INCOMPLETE'; failureCategory = $null; dependencyNodeCount = 2; unresolvedCount = 2; unresolvedDependencies = @([pscustomobject]@{ graph = 'harness'; reason = 'no_approved_source' }, [pscustomobject]@{ graph = 'portable-service'; reason = 'COLLISION_UNRESOLVED' }) }; status = 'INCOMPLETE'; category = 'audit_unresolved_dependencies' }
+  [pscustomobject]@{ name = 'incomplete-without-unresolved-evidence-is-not-mislabeled'; report = [pscustomobject]@{ auditStatus = 'INCOMPLETE'; failureCategory = $null; dependencyNodeCount = 0; unresolvedCount = 0; unresolvedDependencies = @() }; status = 'INCOMPLETE'; category = 'audit_incomplete_without_unresolved_evidence' }
+  [pscustomobject]@{ name = 'fail-with-zero-nodes-does-not-claim-unresolved-dependencies'; report = [pscustomobject]@{ auditStatus = 'FAIL'; failureCategory = ''; dependencyNodeCount = 0; unresolvedCount = 0; unresolvedDependencies = @() }; status = 'FAIL'; category = 'audit_failure_category_unavailable' }
+  [pscustomobject]@{ name = 'fail-unresolved-category-requires-unresolved-evidence'; report = [pscustomobject]@{ auditStatus = 'FAIL'; failureCategory = 'unresolved_dependencies'; dependencyNodeCount = 0; unresolvedCount = 0; unresolvedDependencies = @() }; status = 'FAIL'; category = 'audit_failure_category_unavailable' }
+  [pscustomobject]@{ name = 'pass-with-no-failure-remains-pass'; report = [pscustomobject]@{ auditStatus = 'PASS'; failureCategory = $null; dependencyNodeCount = 4; unresolvedCount = 0; unresolvedDependencies = @() }; status = 'PASS'; category = '' }
+  [pscustomobject]@{ name = 'pass-with-null-unresolved-entry-cannot-pass'; report = [pscustomobject]@{ auditStatus = 'PASS'; failureCategory = $null; dependencyNodeCount = 0; unresolvedCount = 0; unresolvedDependencies = [object[]]@($null) }; status = 'FAIL'; category = 'audit_inconsistent_pass_result' }
+  [pscustomobject]@{ name = 'pass-with-failure-evidence-cannot-report-pass'; report = [pscustomobject]@{ auditStatus = 'PASS'; failureCategory = 'candidate_sha256_mismatch'; dependencyNodeCount = 0; unresolvedCount = 0; unresolvedDependencies = @() }; status = 'FAIL'; category = 'audit_inconsistent_pass_result' }
+  [pscustomobject]@{ name = 'fail-is-not-promoted-to-incomplete'; report = [pscustomobject]@{ auditStatus = 'FAIL'; failureCategory = 'source_commit_mismatch'; dependencyNodeCount = 0; unresolvedCount = 0; unresolvedDependencies = @() }; status = 'FAIL'; category = 'audit_source_commit_mismatch' }
+)
+
+foreach ($case in $classificationCases) {
+  $classification = Get-SanitizedAuditResultClassification -Report $case.report
+  Assert-Equal ([string]$classification.auditStatus) $case.status "classification-status-$($case.name)"
+  Assert-Equal ([string]$classification.failureCategory) $case.category "classification-category-$($case.name)"
+  $serializedClassification = ConvertTo-Json -InputObject $classification -Compress
+  if ($serializedClassification -match 'C:\\Synthetic|Private category|unlisted_private_reason|synthetic exception details|synthetic-body-sentinel' -or
+      $serializedClassification.Contains($syntheticBearer) -or $serializedClassification.Contains($syntheticToken) -or
+      $serializedClassification.Contains($rawDiagnosticJson)) {
+    throw "assertion_failed_classification_leaks_untrusted_category_$($case.name)"
+  }
+  Complete-FailureCategoryTest $case.name
+}
+
+Assert-Equal (ConvertTo-SanitizedAuditFailureCategory -Category 'audit_candidate_sha256_mismatch' -HasAuditPrefix) `
+  'audit_candidate_sha256_mismatch' 'prefixed-wrapper-category-is-allowlisted'
+Complete-FailureCategoryTest 'prefixed-wrapper-category-is-allowlisted'
+Assert-Equal (ConvertTo-SanitizedAuditFailureCategory -Category 'audit_unknown_private_value' -HasAuditPrefix) `
+  'audit_failure_category_unavailable' 'unknown-prefixed-category-is-rejected'
+Complete-FailureCategoryTest 'unknown-prefixed-category-is-rejected'
+
+$moduleTextForCategoryCheck = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\McpStaticDependencyAudit.psm1'))
+$moduleCategorySet = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+foreach ($match in [regex]::Matches($moduleTextForCategoryCheck, "throw\s+'audit_([a-z0-9_]+)'")) {
+  [void]$moduleCategorySet.Add($match.Groups[1].Value)
+}
+foreach ($match in [regex]::Matches($moduleTextForCategoryCheck, "Get-CodexBridgeAuditFullPath[^\r\n]*'([a-z0-9_]+)'\)")) {
+  [void]$moduleCategorySet.Add($match.Groups[1].Value)
+}
+if ($moduleCategorySet.Count -lt 50) { throw 'assertion_failed_module_failure_category_taxonomy_not_discovered' }
+foreach ($moduleCategory in $moduleCategorySet) {
+  if ((ConvertTo-SanitizedAuditFailureCategory -Category $moduleCategory) -cne "audit_$moduleCategory") {
+    throw 'assertion_failed_module_failure_category_missing_from_allowlist'
+  }
+}
+Complete-FailureCategoryTest 'all-module-failure-categories-are-allowlisted'
+
+if ($script:failureCategoryTestsPassed -ne 19) { throw 'assertion_failed_failure_category_test_count' }
+Write-Output "EXISTING_STATIC_AUDIT_TESTS=$existingAuditTestCount/46"
+Write-Output "FAILURE_CATEGORY_TESTS=$script:failureCategoryTestsPassed/19"
 
 Write-Output "TEST_SUMMARY executed=$script:passed failures=0"

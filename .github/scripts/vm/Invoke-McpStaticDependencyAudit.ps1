@@ -6,6 +6,220 @@ $script:AuditReport = $null
 $script:AuditReportSha256 = ''
 $script:AuditFailureCategory = ''
 
+function ConvertTo-SanitizedAuditFailureCategory([AllowNull()][AllowEmptyString()][string]$Category, [switch]$HasAuditPrefix) {
+  $allowedCategories = @(
+    'approved_portable_identity_unverified'
+    'build_identity_mismatch'
+    'build_path_reparse_point'
+    'candidate_architecture_mismatch'
+    'candidate_identity_invalid'
+    'candidate_missing'
+    'candidate_path_invalid'
+    'candidate_path_outside_source_root'
+    'candidate_role_invalid'
+    'candidate_root_missing'
+    'candidate_sha256_invalid'
+    'candidate_sha256_mismatch'
+    'compile_arguments_identity_changed'
+    'compile_or_toolchain_prerequisite_failed'
+    'debug_release_binpath_ambiguous'
+    'dependency_architecture_mismatch'
+    'dependency_cycle'
+    'dependency_depth_limit_exceeded'
+    'dependency_path_escape'
+    'dependency_path_invalid'
+    'dispatch_boundary_mismatch'
+    'dumpbin_architecture_mismatch'
+    'dumpbin_execution_failed'
+    'dumpbin_failed'
+    'dumpbin_format_unrecognized'
+    'dumpbin_import_limit_exceeded'
+    'dumpbin_output_limit_exceeded'
+    'dumpbin_output_unrecognized'
+    'dumpbin_process_cleanup_failed'
+    'dumpbin_process_identity_unverified'
+    'dumpbin_provider_output_invalid'
+    'dumpbin_source_unverified'
+    'dumpbin_temp_collision'
+    'dumpbin_timeout'
+    'dumpbin_unavailable'
+    'duplicate_source_root'
+    'edge_limit_exceeded'
+    'failure'
+    'failure_category_unavailable'
+    'file_content_changed'
+    'file_identity_changed'
+    'file_identity_unavailable'
+    'fixed_schema_identity_mismatch'
+    'fixed_schema_missing'
+    'fixed_schema_sha256_mismatch'
+    'harness_root_outside_swiftpm_build_tree'
+    'incomplete_without_unresolved_evidence'
+    'inconsistent_pass_result'
+    'input_hash_invalid'
+    'internal_audit_failure'
+    'missing_binpath_opt_in_invalid'
+    'msvc_root_missing'
+    'node_limit_exceeded'
+    'path_alias_not_allowed'
+    'path_ancestor_unverified'
+    'package_manifest_missing'
+    'pe_header_invalid'
+    'pe_machine_unrecognized'
+    'portable_resource_invalid'
+    'portable_resource_missing'
+    'portable_resource_path_escape'
+    'portable_service_sha256_mismatch'
+    'prerequisite_or_internal_failure'
+    'relative_path_unrepresentable'
+    'reparse_point_not_allowed'
+    'report_directory_collision'
+    'report_limit_exceeded'
+    'runner_not_windows_x64'
+    'runner_temp_invalid'
+    'show_bin_path_alias_not_allowed'
+    'show_bin_path_configuration_invalid'
+    'show_bin_path_failed_debug'
+    'show_bin_path_failed_release'
+    'show_bin_path_leaf_identity_unresolved'
+    'show_bin_path_missing_debug'
+    'show_bin_path_missing_release'
+    'show_bin_path_not_directory_debug'
+    'show_bin_path_not_directory_release'
+    'show_bin_path_outside_build_root'
+    'show_bin_path_parent_missing_debug'
+    'show_bin_path_parent_missing_release'
+    'show_bin_path_traversal'
+    'show_bin_path_unrecognized_debug'
+    'show_bin_path_unrecognized_release'
+    'source_category_invalid'
+    'source_category_missing'
+    'source_commit_mismatch'
+    'source_depth_limit_exceeded'
+    'source_entry_limit_exceeded'
+    'source_file_limit_exceeded'
+    'source_file_size_limit_exceeded'
+    'source_identity_mismatch'
+    'source_kind_invalid'
+    'source_path_escape'
+    'source_prefix_invalid'
+    'source_root_identity_mismatch'
+    'source_root_invalid'
+    'source_root_missing'
+    'source_root_reparse_point'
+    'source_total_size_limit_exceeded'
+    'source_traversal_timeout'
+    'status'
+    'swift_executable_missing'
+    'swift_identity_mismatch'
+    'swift_installer_identity_changed'
+    'swift_installer_missing'
+    'swift_path_identity_changed'
+    'swift_toolchain_layout_invalid'
+    'swift_variant_mismatch'
+    'swiftpm_lock_identity_changed'
+    'system32_root_invalid'
+    'system32_root_mismatch'
+    'system_dll_architecture_mismatch'
+    'system_dll_path_invalid'
+    'test_target_declaration_missing'
+    'total_timeout'
+    'unresolved_dependencies'
+    'vcpkg_identity_changed'
+    'vcpkg_sqlite_architecture_mismatch'
+    'vcpkg_sqlite_identity_changed'
+    'vcpkg_sqlite_identity_unverified'
+    'vcpkg_sqlite_missing'
+    'windows_build_identity_invalid'
+    'workflow_run_identity_invalid'
+    'workspace_invalid'
+  )
+
+  if ($HasAuditPrefix) {
+    if ($Category -cnotmatch '^audit_([a-z0-9_]{1,96})$') { return 'audit_failure_category_unavailable' }
+    $categoryValue = $Matches[1]
+  } else {
+    if ($Category -cnotmatch '^([a-z0-9_]{1,96})$') { return 'audit_failure_category_unavailable' }
+    $categoryValue = $Matches[1]
+  }
+  if ($allowedCategories -cnotcontains $categoryValue) { return 'audit_failure_category_unavailable' }
+  return "audit_$categoryValue"
+}
+
+function Get-SanitizedAuditResultClassification([Parameter(Mandatory = $true)][object]$Report) {
+  $propertyNames = @($Report.PSObject.Properties.Name)
+  $status = if ($propertyNames -contains 'auditStatus') { ([string]$Report.auditStatus).ToUpperInvariant() } else { '' }
+  if ($status -cnotin @('PASS', 'INCOMPLETE', 'FAIL')) {
+    return [pscustomobject]@{ auditStatus = 'FAIL'; failureCategory = 'audit_failure_category_unavailable' }
+  }
+
+  $hasFailureCategory = $propertyNames -contains 'failureCategory'
+  $rawFailureCategory = if ($hasFailureCategory) { [string]$Report.failureCategory } else { '' }
+  $hasUnresolvedCount = $propertyNames -contains 'unresolvedCount'
+  $hasUnresolvedList = $propertyNames -contains 'unresolvedDependencies'
+  $unresolvedRecords = @()
+  $unresolvedListValid = $false
+  if ($hasUnresolvedList) {
+    $unresolvedValue = $Report.unresolvedDependencies
+    if ($null -ne $unresolvedValue -and
+        $unresolvedValue -is [System.Collections.IEnumerable] -and
+        $unresolvedValue -isnot [string]) {
+      $unresolvedRecords = @($unresolvedValue)
+      $unresolvedListValid = $true
+    }
+  }
+  $unresolvedCount = -1
+  $unresolvedCountValid = $false
+  if ($hasUnresolvedCount) {
+    $unresolvedCountValid = [int]::TryParse([string]$Report.unresolvedCount, [ref]$unresolvedCount) -and
+      $unresolvedCount -ge 0 -and $unresolvedCount -le 2048
+  }
+  $unresolvedRecordsValid = $unresolvedListValid
+  foreach ($record in $unresolvedRecords) {
+    if ($null -eq $record) {
+      $unresolvedRecordsValid = $false
+      break
+    }
+    $recordProperties = @($record.PSObject.Properties.Name)
+    if ($recordProperties -notcontains 'graph' -or $recordProperties -notcontains 'reason' -or
+        [string]$record.graph -cnotin @('harness', 'portable-service') -or
+        [string]$record.reason -cnotmatch '^[A-Za-z0-9_]{1,96}$') {
+      $unresolvedRecordsValid = $false
+      break
+    }
+  }
+  $unresolvedEvidenceValid = $unresolvedCountValid -and $unresolvedRecordsValid -and
+    $unresolvedCount -eq $unresolvedRecords.Count
+
+  if ($status -ceq 'PASS') {
+    if (-not [string]::IsNullOrWhiteSpace($rawFailureCategory) -or
+        -not $unresolvedEvidenceValid -or $unresolvedCount -ne 0) {
+      return [pscustomobject]@{ auditStatus = 'FAIL'; failureCategory = 'audit_inconsistent_pass_result' }
+    }
+    return [pscustomobject]@{ auditStatus = 'PASS'; failureCategory = '' }
+  }
+
+  if ($status -ceq 'INCOMPLETE') {
+    $category = if ($unresolvedEvidenceValid -and $unresolvedCount -gt 0) {
+      'audit_unresolved_dependencies'
+    } else {
+      'audit_incomplete_without_unresolved_evidence'
+    }
+    return [pscustomobject]@{ auditStatus = 'INCOMPLETE'; failureCategory = $category }
+  }
+
+  $category = if ([string]::IsNullOrWhiteSpace($rawFailureCategory)) {
+    'audit_failure_category_unavailable'
+  } else {
+    ConvertTo-SanitizedAuditFailureCategory -Category $rawFailureCategory
+  }
+  if ($category -ceq 'audit_unresolved_dependencies' -and
+      -not ($unresolvedEvidenceValid -and $unresolvedCount -gt 0)) {
+    $category = 'audit_failure_category_unavailable'
+  }
+  return [pscustomobject]@{ auditStatus = 'FAIL'; failureCategory = $category }
+}
+
 function Write-SanitizedAuditOutputs {
   $status = $script:AuditStatus
   $harnessStatus = 'NOT_RUN'
@@ -61,8 +275,9 @@ function Write-SanitizedAuditOutputs {
   Write-Output "UNRESOLVED_COUNT=$unresolvedCount"
   Write-Output "SOURCE_COLLISION_COUNT=$collisionCount"
   Write-Output "AUDIT_REPORT_SHA256=$reportSha"
-  if ($script:AuditFailureCategory -match '^audit_[a-z0-9_]+$') {
-    Write-Output "AUDIT_FAILURE_CATEGORY=$script:AuditFailureCategory"
+  if (-not [string]::IsNullOrWhiteSpace($script:AuditFailureCategory)) {
+    $safeFailureCategory = ConvertTo-SanitizedAuditFailureCategory -Category $script:AuditFailureCategory -HasAuditPrefix
+    Write-Output "AUDIT_FAILURE_CATEGORY=$safeFailureCategory"
   }
   Write-Output 'RUNNER_TEST_DISCOVERY=NOT_VERIFIED'
   Write-Output 'DIRECT_RUNNER_EXECUTION=NOT_VERIFIED'
@@ -315,18 +530,19 @@ try {
     -DumpbinPath $env:MSVC_DUMPBIN_PATH -FixedSchemaPath $schemaPath -ExpectedSchemaSha256 $expectedSchemaSha `
     -MaximumNodes 256 -MaximumEdges 2048 -MaximumOutputCharacters 1048576
   $script:AuditReport = $report
-  $script:AuditStatus = $report.auditStatus.ToUpperInvariant()
+  $classification = Get-SanitizedAuditResultClassification -Report $report
+  $script:AuditStatus = $classification.auditStatus
+  $script:AuditFailureCategory = $classification.failureCategory
   $json = ConvertTo-Json -InputObject $report -Depth 18
   [IO.File]::WriteAllText($reportPath, $json, [Text.UTF8Encoding]::new($false))
   $reportSha = Get-FileSha256 $reportPath
   $script:AuditReportSha256 = $reportSha
-  if ($report.auditStatus -ne 'PASS') {
-    $failure = if ($report.failureCategory) { $report.failureCategory } else { 'unresolved_dependencies' }
-    $script:AuditFailureCategory = if ($failure -match '^audit_[a-z0-9_]+$') { $failure } else { 'audit_unresolved_dependencies' }
-  }
 } catch {
-  $category = if ($_.Exception.Message -match '^audit_[a-z0-9_]+$') { $_.Exception.Message } else { 'audit_prerequisite_or_internal_failure' }
-  $script:AuditFailureCategory = $category
+  if ($_.Exception.Message -cmatch '^audit_[a-z0-9_]{1,96}$') {
+    $script:AuditFailureCategory = ConvertTo-SanitizedAuditFailureCategory -Category $_.Exception.Message -HasAuditPrefix
+  } else {
+    $script:AuditFailureCategory = 'audit_prerequisite_or_internal_failure'
+  }
   if ($script:AuditReport) {
     if ($script:AuditReport.auditStatus -ceq 'INCOMPLETE' -and $script:AuditReportSha256 -match '^[0-9a-f]{64}$') {
       $script:AuditStatus = 'INCOMPLETE'
